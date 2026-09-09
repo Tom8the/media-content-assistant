@@ -19,9 +19,7 @@ class PaddleOCREngine:
         try:
             from paddleocr import PaddleOCR
         except ImportError as error:
-            raise RuntimeError(
-                '未安装本地 OCR 依赖，请执行 pip install -e ".[ocr]"'
-            ) from error
+            raise RuntimeError('未安装本地 OCR 依赖，请执行 pip install -e ".[ocr]"') from error
         self._engine = PaddleOCR(
             device=self.settings.device,
             text_detection_model_name=self.settings.detection_model_name,

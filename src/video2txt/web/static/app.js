@@ -8,6 +8,7 @@ const statusLabels = {
   subtitle_processing: "处理字幕",
   aligning: "时间轴对齐",
   exporting: "生成结果",
+  translating: "翻译中文字幕",
   completed: "已完成",
   failed: "失败",
   cancelled: "已取消",
@@ -16,11 +17,56 @@ const modeLabels = { verbatim: "逐字稿", subtitle: "字幕稿", clean: "整�
 const estimateRealtimeFactor = 0.22;
 const estimateHardSubtitleFactor = 0.9;
 const estimateSecondsPerMB = 1.85;
+const apiHotwordsStorageKey = "video2txt.api-hotwords.v1";
 
 let currentBatchId = null;
 let currentBatch = null;
 let currentTaskId = null;
 let pollTimer = null;
+let historyPage = 1;
+const historyPageSize = 12;
+let healthState = null;
+
+function restoreApiHotwords() {
+  try {
+    const saved = localStorage.getItem(apiHotwordsStorageKey);
+    if (saved !== null) $("#api-hotwords-input").value = saved;
+  } catch {
+    // The default hotwords remain available when browser storage is disabled.
+  }
+}
+
+function saveApiHotwords() {
+  try {
+    localStorage.setItem(apiHotwordsStorageKey, $("#api-hotwords-input").value);
+  } catch {
+    // Saving hotwords must never prevent a transcription task from being submitted.
+  }
+}
+
+function selectedAsrMode() {
+  return document.querySelector('input[name="asr_mode"]:checked')?.value || "local";
+}
+
+function updateAsrControls() {
+  const isApi = selectedAsrMode() === "api";
+  const health = healthState || {};
+  $("#api-asr-options").hidden = !isApi;
+  const translation = $("#translate-to-chinese-input");
+  const translationHint = $("#translation-hint");
+  if (isApi) {
+    translation.checked = true;
+    translation.disabled = true;
+    translationHint.textContent = "API 模式固定由本机 Codex CLI 翻译为简体中文；会同时导出中文 TXT 和 SRT。";
+    $("#submit-button").disabled = !health.api_pipeline_available;
+    return;
+  }
+  translation.disabled = !health.translation_models_available;
+  translationHint.textContent = health.translation_models_available
+    ? "开始提取前勾选才会生成中文文件；本地模式使用离线 NLLB 翻译。"
+    : "离线翻译模型尚未安装";
+  $("#submit-button").disabled = !health.model_configured;
+}
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -61,6 +107,11 @@ function selectedExportTypes(attribute) {
 
 function exportQuery(types) {
   return types.map((type) => `types=${encodeURIComponent(type)}`).join("&");
+}
+
+function exportTypeLabel(types) {
+  const labels = { text: "文本", subtitle: "原字幕", translation: "中文字幕", translation_text: "中文文本" };
+  return types.map((type) => labels[type] || type).join(" + ");
 }
 
 function estimatedTaskSeconds(task) {
@@ -156,6 +207,8 @@ function renderBatch(batch) {
       formatBytes(task.media_size),
       modeLabels[task.mode] || task.mode,
       task.hard_subtitles ? "硬字幕 OCR" : "",
+      task.asr_mode === "api" ? "千问 API + Codex 翻译" : "本地模型",
+      task.translate_to_chinese ? "中文字幕" : "",
     ].filter(Boolean).join(" · ");
     const detail = task.status === "failed"
       ? escapeHtml(task.error || "处理失败")
@@ -175,7 +228,7 @@ function renderBatch(batch) {
   exportLink.setAttribute("aria-disabled", String(!canExport));
   if (canExport) {
     exportLink.href = `/api/batches/${batch.batch_id}/export.zip?${exportQuery(exportTypes)}`;
-    exportLink.textContent = `下载 ${completed} 个结果`;
+    exportLink.textContent = `下载 ${completed} 个${exportTypeLabel(exportTypes)}（ZIP）`;
   } else {
     exportLink.removeAttribute("href");
     exportLink.textContent = "批量下载";
@@ -190,7 +243,7 @@ function renderCompleted(task) {
   showPanel("completed");
   $("#task-state").textContent = "已完成";
   $("#completed-mode").textContent = modeLabels[task.mode] || task.mode;
-  $("#completed-file-count").textContent = "TXT / SRT";
+  $("#completed-file-count").textContent = task.translate_to_chinese ? "TXT / SRT / 中文字幕 / 中文文本" : "TXT / SRT";
   $("#transcript-preview").textContent = task.transcript_preview || "没有可预览文本";
   updateTaskExportLink();
   $("#warning-text").textContent = task.warnings?.filter((item) => item !== "ASR cache hit").join(" · ") || "";
@@ -209,42 +262,54 @@ function renderFailed(task) {
 }
 
 async function viewTask(taskId, restoreBatch = false) {
-  const response = await fetch(`/api/tasks/${taskId}`, { cache: "no-store" });
-  if (!response.ok) throw new Error("无法读取任务状态");
-  const task = await response.json();
-  if (restoreBatch) {
-    currentBatch = null;
-    currentBatchId = null;
-    if (task.batch_id) {
-      try {
-        const batchResponse = await fetch(`/api/batches/${task.batch_id}`, { cache: "no-store" });
-        if (batchResponse.ok) {
-          currentBatch = await batchResponse.json();
-          currentBatchId = currentBatch.batch_id;
-        }
-      } catch { /* 批次记录不可用时仍可查看并返回最近任务 */ }
+  const previousTaskId = currentTaskId;
+  // 先进入详情状态，防止已发出的批次轮询在详情请求返回前覆盖页面。
+  currentTaskId = taskId;
+  try {
+    const response = await fetch(`/api/tasks/${taskId}`, { cache: "no-store" });
+    if (!response.ok) throw new Error("无法读取任务状态");
+    const task = await response.json();
+    if (restoreBatch) {
+      currentBatch = null;
+      currentBatchId = null;
+      if (task.batch_id) {
+        try {
+          const batchResponse = await fetch(`/api/batches/${task.batch_id}`, { cache: "no-store" });
+          if (batchResponse.ok) {
+            currentBatch = await batchResponse.json();
+            currentBatchId = currentBatch.batch_id;
+          }
+        } catch { /* 批次记录不可用时仍可查看并返回最近任务 */ }
+      }
     }
+    $("#form-error").textContent = "";
+    if (task.status === "completed") renderCompleted(task);
+    else if (task.status === "failed") renderFailed(task);
+  } catch (error) {
+    currentTaskId = previousTaskId;
+    throw error;
   }
-  $("#form-error").textContent = "";
-  if (task.status === "completed") renderCompleted(task);
-  else if (task.status === "failed") renderFailed(task);
 }
 
 async function pollBatch() {
-  if (!currentBatchId) return;
+  const batchId = currentBatchId;
+  if (!batchId) return;
   try {
-    const response = await fetch(`/api/batches/${currentBatchId}`, { cache: "no-store" });
+    const response = await fetch(`/api/batches/${batchId}`, { cache: "no-store" });
     if (!response.ok) throw new Error("无法读取批次状态");
     const batch = await response.json();
+    // 新批次已开始或正在查看详情时，丢弃旧请求的页面更新。
+    if (batchId !== currentBatchId) return;
+    currentBatch = batch;
     $("#form-error").textContent = "";
-    renderBatch(batch);
+    if (!currentTaskId) renderBatch(batch);
     if (batch.tasks.every((task) => terminalStatuses.has(task.status))) {
       clearInterval(pollTimer);
       pollTimer = null;
       loadHistory();
     }
   } catch (error) {
-    $("#form-error").textContent = error.message;
+    if (batchId === currentBatchId) $("#form-error").textContent = error.message;
   }
 }
 
@@ -321,6 +386,7 @@ async function loadHealth() {
   try {
     const response = await fetch("/api/health", { cache: "no-store" });
     const health = await response.json();
+    healthState = health;
     $("#app-version").textContent = health.version;
     const pill = $("#engine-pill");
     if (health.model_configured) {
@@ -328,25 +394,37 @@ async function loadHealth() {
       $("#engine-label").textContent = `${health.model_name} · ${health.device.toUpperCase()} ${health.compute_type.toUpperCase()}`;
     } else {
       pill.classList.add("error");
-      $("#engine-label").textContent = "本地模型未配置";
-      $("#submit-button").disabled = true;
+      $("#engine-label").textContent = health.api_pipeline_available ? "千问 API · Codex CLI 可用" : "本地模型未配置";
     }
     if (!health.ocr_available) {
       $("#hard-subtitles-input").disabled = true;
       $("#ocr-hint").textContent = "本地 OCR 运行时未安装";
     }
+    if (!health.api_pipeline_available) {
+      $("#api-asr-hint").textContent = `API 模式未就绪：请在启动服务前设置 ${health.api_key_environment}，并确认 requests 与 Codex CLI 可用。`;
+    }
+    updateAsrControls();
   } catch {
     $("#engine-pill").classList.add("error");
     $("#engine-label").textContent = "本地服务未连接";
   }
 }
 
-async function loadHistory() {
+async function loadHistory(page = historyPage) {
   try {
-    const response = await fetch("/api/tasks", { cache: "no-store" });
-    const { tasks } = await response.json();
-    if (!tasks.length) { $("#history-list").innerHTML = '<p class="history-empty">暂无历史任务</p>'; return; }
-    $("#history-list").innerHTML = tasks.slice(0, 8).map((task) => `
+    historyPage = Math.max(1, page);
+    const response = await fetch(`/api/tasks?page=${historyPage}&page_size=${historyPageSize}`, { cache: "no-store" });
+    const { tasks, total = 0, total_pages: totalPages = 1 } = await response.json();
+    if (!tasks.length && total > 0 && historyPage > 1) {
+      await loadHistory(historyPage - 1);
+      return;
+    }
+    if (!tasks.length) {
+      $("#history-list").innerHTML = '<p class="history-empty">暂无历史任务</p>';
+      $("#history-pagination").hidden = true;
+      return;
+    }
+    $("#history-list").innerHTML = tasks.map((task) => `
       <article class="history-item">
         <div><strong>${escapeHtml(task.original_filename || task.task_id.slice(0, 10))}</strong><small>${escapeHtml(task.updated_at || "")} · ${escapeHtml(modeLabels[task.mode] || task.mode)}</small></div>
         <span class="history-status">${task.status === "completed" ? "已完成" : escapeHtml(statusLabels[task.status] || task.status)}</span>
@@ -357,13 +435,19 @@ async function loadHistory() {
             <div class="history-download-menu">
               <a href="/api/tasks/${escapeHtml(task.task_id)}/export?types=text">文本文件</a>
               <a href="/api/tasks/${escapeHtml(task.task_id)}/export?types=subtitle">字幕文件</a>
-              <a href="/api/tasks/${escapeHtml(task.task_id)}/export?types=text&types=subtitle">全部</a>
+              ${task.download_files?.includes("translated_subtitles_zh.srt") ? `<a href="/api/tasks/${escapeHtml(task.task_id)}/export?types=translation">中文字幕文件</a>` : ""}
+              ${task.download_files?.includes("translated_transcript_zh.txt") ? `<a href="/api/tasks/${escapeHtml(task.task_id)}/export?types=translation_text">中文文本文件</a>` : ""}
+              <a href="/api/tasks/${escapeHtml(task.task_id)}/export?types=text&types=subtitle${task.download_files?.includes("translated_subtitles_zh.srt") ? "&types=translation" : ""}${task.download_files?.includes("translated_transcript_zh.txt") ? "&types=translation_text" : ""}">全部</a>
             </div>
           </details>` : ""}
           ${task.status === "failed" ? `<button type="button" data-retry-task-id="${escapeHtml(task.task_id)}">重试</button>` : ""}
           ${terminalStatuses.has(task.status) ? `<button type="button" class="danger-button" data-delete-task-id="${escapeHtml(task.task_id)}">删除</button>` : ""}
         </div>
       </article>`).join("");
+    $("#history-pagination").hidden = totalPages <= 1;
+    $("#history-page-info").textContent = `第 ${historyPage} / ${totalPages} 页 · 共 ${total} 个任务`;
+    $("#history-previous").disabled = historyPage <= 1;
+    $("#history-next").disabled = historyPage >= totalPages;
   } catch { /* 页面主体仍可使用 */ }
 }
 
@@ -468,16 +552,24 @@ function updateTaskExportLink() {
   }
   exportLink.setAttribute("aria-disabled", "false");
   exportLink.href = `/api/tasks/${currentTaskId}/export?${exportQuery(exportTypes)}`;
+  exportLink.textContent = exportTypes.length === 1
+    ? `下载${exportTypeLabel(exportTypes)}`
+    : `下载 ${exportTypeLabel(exportTypes)}（ZIP）`;
 }
 
 $("#task-form").addEventListener("submit", submitForm);
+restoreApiHotwords();
+$("#api-hotwords-input").addEventListener("input", saveApiHotwords);
 $("#media-input").addEventListener("change", updateFileLabel);
 $("#subtitle-input").addEventListener("change", updateSubtitleLabel);
-$("#refresh-history").addEventListener("click", loadHistory);
+$("#refresh-history").addEventListener("click", () => loadHistory(1));
+$("#history-previous").addEventListener("click", () => loadHistory(historyPage - 1));
+$("#history-next").addEventListener("click", () => loadHistory(historyPage + 1));
 $("#completed-back").addEventListener("click", returnFromTask);
 $("#failed-back").addEventListener("click", returnFromTask);
 document.querySelectorAll("input[data-batch-export-type]").forEach((input) => input.addEventListener("change", () => { if (currentBatch) renderBatch(currentBatch); }));
 document.querySelectorAll("input[data-task-export-type]").forEach((input) => input.addEventListener("change", updateTaskExportLink));
+document.querySelectorAll('input[name="asr_mode"]').forEach((input) => input.addEventListener("change", updateAsrControls));
 $("#reset-button").addEventListener("click", () => { currentTaskId = null; currentBatch = null; currentBatchId = null; showPanel("empty"); $("#task-state").textContent = "等待素材"; });
 $("#delete-completed-task").addEventListener("click", async () => { if (currentTaskId) await deleteTask(currentTaskId); });
 $("#retry-failed-task").addEventListener("click", async () => { if (currentTaskId) await retryTask(currentTaskId); });

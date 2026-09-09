@@ -15,9 +15,7 @@ def _load_subtitle(path: Path):  # type: ignore[no-untyped-def]
     try:
         import pysubs2
     except ImportError as error:
-        raise SubtitleParseError(
-            '未安装字幕依赖，请执行 pip install -e ".[subtitles]"'
-        ) from error
+        raise SubtitleParseError('未安装字幕依赖，请执行 pip install -e ".[subtitles]"') from error
 
     failures: list[str] = []
     for encoding in DEFAULT_ENCODINGS:
@@ -61,4 +59,3 @@ def parse_subtitle_file(
     if not cues:
         raise SubtitleParseError("字幕文件中没有可用文本")
     return cues
-

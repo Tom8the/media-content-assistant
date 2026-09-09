@@ -16,7 +16,8 @@ class FFmpegSettings(BaseModel):
 class ASRSettings(BaseModel):
     engine: Literal["faster-whisper"] = "faster-whisper"
     model_path: Path | None = None
-    language: str | None = "zh"
+    # None lets Whisper detect each recording instead of forcing Chinese ASR.
+    language: str | None = None
     device: Literal["auto", "cpu", "cuda"] = "cpu"
     compute_type: str = "int8"
     cpu_threads: int = Field(default=4, ge=1)
@@ -93,12 +94,44 @@ class PathSettings(BaseModel):
     output_dir: Path = Path("output")
 
 
+class TranslationSettings(BaseModel):
+    model_path: Path = Path("models/nllb-ct2-int8")
+    device: Literal["cpu", "cuda"] = "cpu"
+    compute_type: Literal["int8", "int8_float32"] = "int8"
+    inter_threads: int = Field(default=1, ge=1)
+    intra_threads: int = Field(default=8, ge=0)
+
+
+class QwenASRSettings(BaseModel):
+    """Non-secret settings for Qwen file transcription."""
+
+    model: str = "qwen-audio-3.0-asr-flash-filetrans"
+    region: Literal["beijing", "singapore"] = "beijing"
+    workspace_id: str | None = None
+    api_key_environment: str = "DASHSCOPE_API_KEY"
+    poll_interval_seconds: float = Field(default=5, ge=1, le=60)
+    wait_timeout_seconds: float = Field(default=3600, ge=30, le=86_400)
+    hotword_weight: int = Field(default=3, ge=1, le=5)
+
+
+class CodexTranslationSettings(BaseModel):
+    """Local Codex CLI invocation settings; authentication stays in Codex itself."""
+
+    command: str = "codex"
+    model: str | None = None
+    timeout_seconds: int = Field(default=900, ge=30, le=7_200)
+    batch_size: int = Field(default=24, ge=1, le=100)
+
+
 class Settings(BaseModel):
     ffmpeg: FFmpegSettings = Field(default_factory=FFmpegSettings)
     asr: ASRSettings = Field(default_factory=ASRSettings)
     ocr: OCRSettings = Field(default_factory=OCRSettings)
     alignment: AlignmentSettings = Field(default_factory=AlignmentSettings)
     paths: PathSettings = Field(default_factory=PathSettings)
+    translation: TranslationSettings = Field(default_factory=TranslationSettings)
+    qwen_asr: QwenASRSettings = Field(default_factory=QwenASRSettings)
+    codex_translation: CodexTranslationSettings = Field(default_factory=CodexTranslationSettings)
 
 
 def _load_toml(path: Path | None) -> dict[str, Any]:

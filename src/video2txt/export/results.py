@@ -12,9 +12,7 @@ def export_text(segments: list[FusionSegment], path: Path) -> Path:
     target = path.resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
     included = [
-        segment
-        for segment in segments
-        if segment.include_in_transcript and segment.text.strip()
+        segment for segment in segments if segment.include_in_transcript and segment.text.strip()
     ]
     if any(segment.original_text is not None for segment in included):
         paragraphs: list[str] = []

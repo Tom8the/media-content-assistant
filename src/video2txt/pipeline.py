@@ -9,6 +9,7 @@ from uuid import uuid4
 from video2txt.align.fusion import fuse_timeline
 from video2txt.align.timeline import align_timeline
 from video2txt.asr.faster_whisper import FasterWhisperEngine
+from video2txt.asr.qwen import QwenFileTranscriptionEngine
 from video2txt.cleaning import clean_fusion_segments
 from video2txt.config import Settings
 from video2txt.export.results import export_json, export_srt, export_text
@@ -21,6 +22,7 @@ from video2txt.media.probe import (
 )
 from video2txt.media.subtitles import extract_text_subtitle
 from video2txt.models import (
+    ASRMode,
     FusionMode,
     SourceType,
     SubtitleCue,
@@ -32,6 +34,7 @@ from video2txt.models import (
 )
 from video2txt.ocr.hard_subtitles import HardSubtitleProgress, extract_hard_subtitles
 from video2txt.subtitles.parser import parse_subtitle_file
+from video2txt.translation import CodexCLIChineseTranslator, NLLBChineseTranslator
 
 
 def _now() -> str:
@@ -58,9 +61,7 @@ def _write_model(path: Path, model: object) -> None:
 
 def _write_subtitles(path: Path, subtitles: list[SubtitleCue]) -> None:
     payload = [cue.model_dump(mode="json") for cue in subtitles]
-    _write_text_atomic(
-        path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-    )
+    _write_text_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
 
 def _write_json_records(path: Path, records: list[object]) -> None:
@@ -68,9 +69,7 @@ def _write_json_records(path: Path, records: list[object]) -> None:
         record.model_dump(mode="json") if hasattr(record, "model_dump") else record
         for record in records
     ]
-    _write_text_atomic(
-        path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-    )
+    _write_text_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
 
 class TranscriptionPipeline:
@@ -87,8 +86,13 @@ class TranscriptionPipeline:
         manifest.status = status
         self._write_manifest(manifest)
 
-    def _asr_cache_path(self, audio: Path) -> Path:
-        options = self.settings.asr.model_dump(mode="json")
+    def _asr_cache_path(self, audio: Path, *, asr_mode: ASRMode, api_hotwords: list[str]) -> Path:
+        options: dict[str, object] = {"mode": asr_mode.value}
+        if asr_mode == ASRMode.LOCAL:
+            options["asr"] = self.settings.asr.model_dump(mode="json")
+        else:
+            options["qwen_asr"] = self.settings.qwen_asr.model_dump(mode="json")
+            options["hotwords"] = api_hotwords
         payload = json.dumps(
             {"audio_sha256": sha256_file(audio), "options": options},
             ensure_ascii=False,
@@ -97,12 +101,24 @@ class TranscriptionPipeline:
         key = hashlib.sha256(payload).hexdigest()
         return self.settings.paths.work_dir.resolve() / "cache" / "asr" / f"{key}.json"
 
-    def _transcribe_with_cache(self, audio: Path, manifest: TaskManifest) -> Transcript:
-        cache_path = self._asr_cache_path(audio)
+    def _transcribe_with_cache(
+        self,
+        audio: Path,
+        manifest: TaskManifest,
+        *,
+        asr_mode: ASRMode,
+        api_hotwords: list[str],
+    ) -> Transcript:
+        cache_path = self._asr_cache_path(audio, asr_mode=asr_mode, api_hotwords=api_hotwords)
         if cache_path.is_file():
             manifest.warnings.append("ASR cache hit")
             return Transcript.model_validate_json(cache_path.read_text(encoding="utf-8"))
-        transcript = FasterWhisperEngine(self.settings.asr).transcribe(audio)
+        if asr_mode == ASRMode.LOCAL:
+            transcript = FasterWhisperEngine(self.settings.asr).transcribe(audio)
+        else:
+            transcript = QwenFileTranscriptionEngine(
+                self.settings.qwen_asr, hotwords=api_hotwords
+            ).transcribe(audio, manifest.work_dir)
         _write_model(cache_path, transcript)
         return transcript
 
@@ -119,6 +135,9 @@ class TranscriptionPipeline:
         original_filename: str | None = None,
         batch_id: str | None = None,
         hard_subtitles: bool | None = None,
+        translate_to_chinese: bool = False,
+        asr_mode: ASRMode = ASRMode.LOCAL,
+        api_hotwords: list[str] | None = None,
     ) -> TaskManifest:
         source = input_path.resolve()
         if not source.is_file():
@@ -126,9 +145,11 @@ class TranscriptionPipeline:
         resolved_task_id = task_id or uuid4().hex
         work_dir = self.settings.paths.work_dir.resolve() / resolved_task_id
         result_dir = (output_dir or self.settings.paths.output_dir / resolved_task_id).resolve()
-        use_hard_subtitles = (
-            self.settings.ocr.enabled if hard_subtitles is None else hard_subtitles
+        use_hard_subtitles = self.settings.ocr.enabled if hard_subtitles is None else hard_subtitles
+        normalized_hotwords = list(
+            dict.fromkeys(word.strip() for word in (api_hotwords or []) if word.strip())
         )
+        should_translate = translate_to_chinese or asr_mode == ASRMode.API
         created_at = _now()
         manifest = TaskManifest(
             task_id=resolved_task_id,
@@ -139,7 +160,14 @@ class TranscriptionPipeline:
             work_dir=work_dir,
             output_dir=result_dir,
             mode=mode,
+            asr_mode=asr_mode,
+            api_language=None,
+            api_hotwords=normalized_hotwords if asr_mode == ASRMode.API else [],
             hard_subtitles=use_hard_subtitles,
+            translate_to_chinese=should_translate,
+            translation_backend=("codex-cli" if asr_mode == ASRMode.API else "nllb")
+            if should_translate
+            else None,
             created_at=created_at,
             updated_at=created_at,
         )
@@ -148,6 +176,14 @@ class TranscriptionPipeline:
         self._write_manifest(manifest)
 
         try:
+            if asr_mode == ASRMode.API:
+                QwenFileTranscriptionEngine(
+                    self.settings.qwen_asr,
+                    hotwords=normalized_hotwords,
+                ).ensure_available()
+                CodexCLIChineseTranslator(
+                    self.settings.codex_translation, working_dir=work_dir
+                ).ensure_available()
             self._set_status(manifest, TaskStatus.PROBING)
             probe = probe_media(source, ffprobe_path=self.settings.ffmpeg.ffprobe_path)
             manifest.input_sha256 = probe.sha256
@@ -157,7 +193,7 @@ class TranscriptionPipeline:
             audio_stream = select_audio_stream(
                 probe,
                 stream_index=audio_stream_index,
-                language=self.settings.asr.language,
+                language=None if asr_mode == ASRMode.API else self.settings.asr.language,
             )
             manifest.selected_audio_stream = audio_stream.index
 
@@ -171,7 +207,12 @@ class TranscriptionPipeline:
             manifest.artifacts["normalized_audio"] = str(audio_path)
 
             self._set_status(manifest, TaskStatus.TRANSCRIBING)
-            transcript = self._transcribe_with_cache(audio_path, manifest)
+            transcript = self._transcribe_with_cache(
+                audio_path,
+                manifest,
+                asr_mode=asr_mode,
+                api_hotwords=normalized_hotwords,
+            )
             _write_model(work_dir / "asr.json", transcript)
             _write_model(result_dir / "asr.json", transcript)
             manifest.artifacts["asr_json"] = str(result_dir / "asr.json")
@@ -273,9 +314,7 @@ class TranscriptionPipeline:
             manifest.artifacts["subtitle_json"] = str(result_dir / "subtitle_raw.json")
 
             self._set_status(manifest, TaskStatus.ALIGNING)
-            alignment = align_timeline(
-                transcript.segments, subtitles, self.settings.alignment
-            )
+            alignment = align_timeline(transcript.segments, subtitles, self.settings.alignment)
             fusion = fuse_timeline(
                 alignment,
                 transcript.segments,
@@ -294,13 +333,11 @@ class TranscriptionPipeline:
                     f"整理为 {cleaning.paragraph_count} 个段落"
                 )
             excluded_hard_subtitles = sum(
-                segment.decision == "hard_subtitle_unmatched_review"
-                for segment in fusion
+                segment.decision == "hard_subtitle_unmatched_review" for segment in fusion
             )
             if excluded_hard_subtitles:
                 manifest.warnings.append(
-                    f"{excluded_hard_subtitles} 条未匹配硬字幕已保留在融合详情中，"
-                    "但未直接写入正文"
+                    f"{excluded_hard_subtitles} 条未匹配硬字幕已保留在融合详情中，但未直接写入正文"
                 )
             if subtitles:
                 matched = sum(group.matched for group in alignment.groups)
@@ -321,6 +358,22 @@ class TranscriptionPipeline:
             manifest.artifacts["fusion_json"] = str(
                 export_json(alignment, fusion, result_dir / "fusion.json")
             )
+            if should_translate:
+                self._set_status(manifest, TaskStatus.TRANSLATING)
+                if asr_mode == ASRMode.API:
+                    translated = CodexCLIChineseTranslator(
+                        self.settings.codex_translation, working_dir=work_dir
+                    ).translate_segments(fusion)
+                else:
+                    translated = NLLBChineseTranslator(
+                        self.settings.translation
+                    ).translate_segments(fusion)
+                manifest.artifacts["translated_subtitles_zh_srt"] = str(
+                    export_srt(translated, result_dir / "translated_subtitles_zh.srt")
+                )
+                manifest.artifacts["translated_transcript_zh_txt"] = str(
+                    export_text(translated, result_dir / "translated_transcript_zh.txt")
+                )
 
             self._set_status(manifest, TaskStatus.COMPLETED)
             return manifest

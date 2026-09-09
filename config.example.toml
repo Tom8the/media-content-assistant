@@ -5,7 +5,8 @@ ffprobe_path = "ffprobe"
 [asr]
 engine = "faster-whisper"
 model_path = "models/faster-whisper-small"
-language = "zh"
+# 留空即由 Whisper 自动识别语言；适合阿拉伯语、英语或两者混说的视频。
+# language = "ar"
 device = "cpu"
 compute_type = "int8"
 cpu_threads = 4
@@ -51,3 +52,28 @@ progress_interval_frames = 5
 [paths]
 work_dir = "work"
 output_dir = "output"
+
+[translation]
+# NLLB INT8 直译模型目录；首次执行 video2txt install-translation-models 下载。
+model_path = "models/nllb-ct2-int8"
+device = "cpu"
+compute_type = "int8"
+inter_threads = 1
+intra_threads = 8
+
+[qwen_asr]
+# API Key 请仅通过环境变量 DASHSCOPE_API_KEY 设置，勿写入本文件。
+model = "qwen-audio-3.0-asr-flash-filetrans"
+region = "beijing"
+# workspace_id = "your-workspace-id"
+api_key_environment = "DASHSCOPE_API_KEY"
+poll_interval_seconds = 5
+wait_timeout_seconds = 3600
+hotword_weight = 3
+
+[codex_translation]
+# API 模式由本机已登录的 Codex CLI 翻译；不需要另行配置 API Key。
+command = "codex"
+# model = ""
+timeout_seconds = 900
+batch_size = 24

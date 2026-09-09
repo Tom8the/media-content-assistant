@@ -9,9 +9,7 @@ def _opencc_converter():  # type: ignore[no-untyped-def]
     try:
         from opencc import OpenCC
     except ImportError as error:
-        raise RuntimeError(
-            '未安装简繁转换依赖，请执行 pip install -e ".[subtitles]"'
-        ) from error
+        raise RuntimeError('未安装简繁转换依赖，请执行 pip install -e ".[subtitles]"') from error
     return OpenCC("t2s")
 
 
@@ -27,7 +25,5 @@ def normalize_text(text: str, *, simplify_chinese: bool = True) -> str:
     return "".join(
         character
         for character in normalized
-        if not character.isspace()
-        and not unicodedata.category(character).startswith(("P", "S"))
+        if not character.isspace() and not unicodedata.category(character).startswith(("P", "S"))
     )
-

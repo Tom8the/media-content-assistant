@@ -17,4 +17,3 @@ def configure_logging(*, verbose: bool = False, log_file: Path | None = None) ->
         handlers=handlers,
         force=True,
     )
-

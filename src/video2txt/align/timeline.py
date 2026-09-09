@@ -104,9 +104,7 @@ def align_timeline(
             asr_end = max(item.end for item in asr_items)
             subtitle_start = min(max(0.0, item.start - offset) for item in subtitle_items)
             subtitle_end = max(max(0.0, item.end - offset) for item in subtitle_items)
-            time_score = interval_overlap_score(
-                asr_start, asr_end, subtitle_start, subtitle_end
-            )
+            time_score = interval_overlap_score(asr_start, asr_end, subtitle_start, subtitle_end)
             similarity = text_similarity(
                 "".join(item.text for item in asr_items),
                 "".join(item.text for item in subtitle_items),
@@ -167,9 +165,7 @@ def align_timeline(
         candidates: list[tuple[float, int, int, AlignmentGroup]] = []
         if current_gap <= tolerance:
             for asr_count in range(1, min(3, len(asr_segments) - asr_index) + 1):
-                for subtitle_count in range(
-                    1, min(3, len(subtitles) - subtitle_index) + 1
-                ):
+                for subtitle_count in range(1, min(3, len(subtitles) - subtitle_index) + 1):
                     candidate = build_group(
                         asr_segments[asr_index : asr_index + asr_count],
                         subtitles[subtitle_index : subtitle_index + subtitle_count],

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "video2txt"
-version = "1.0.0"
+version = "2.0.0"
 description = "Local-first video/audio transcription and subtitle fusion"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -14,6 +14,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+qwen-test = ["requests>=2.32,<3"]
+api = ["requests>=2.32,<3"]
 asr = ["faster-whisper>=1.2,<2"]
 subtitles = [
   "opencc-python-reimplemented>=0.1.7,<1",
@@ -30,21 +32,14 @@ web = [
   "python-multipart>=0.0.20,<1",
   "uvicorn[standard]>=0.35,<1",
 ]
-dev = ["pytest>=8.3,<10", "pytest-cov>=6,<8", "ruff>=0.9,<1"]
+translation = [
+  "ctranslate2>=4.6,<5",
+  "huggingface-hub>=0.28,<1",
+  "sentencepiece>=0.2,<1",
+]
 
 [project.scripts]
 video2txt = "video2txt.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/video2txt"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = "-q"
-
-[tool.ruff]
-line-length = 100
-target-version = "py311"
-
-[tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]

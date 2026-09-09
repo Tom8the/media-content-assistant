@@ -47,4 +47,3 @@ def extract_text_subtitle(
     if not target.is_file() or target.stat().st_size == 0:
         raise SubtitleExtractionError("FFmpeg 未生成有效字幕文件")
     return target
-

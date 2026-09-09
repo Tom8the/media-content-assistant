@@ -132,14 +132,16 @@ def probe_media(path: Path, *, ffprobe_path: str = "ffprobe") -> MediaProbe:
         str(source),
     ]
     try:
-        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        result = subprocess.run(command, capture_output=True, check=False)
     except OSError as error:
         raise MediaProbeError(f"无法启动 FFprobe：{error}") from error
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
     if result.returncode != 0:
-        detail = result.stderr.strip() or f"exit code {result.returncode}"
+        detail = stderr.strip() or f"exit code {result.returncode}"
         raise MediaProbeError(f"FFprobe 无法解析媒体文件：{detail}")
     try:
-        payload = json.loads(result.stdout)
+        payload = json.loads(stdout)
     except json.JSONDecodeError as error:
         raise MediaProbeError("FFprobe 返回了无效 JSON") from error
     return parse_ffprobe(payload, path=source, sha256=sha256_file(source))
@@ -179,9 +181,7 @@ def select_stream(
 def select_audio_stream(
     probe: MediaProbe, *, stream_index: int | None = None, language: str | None = None
 ) -> MediaStream:
-    selected = select_stream(
-        probe, StreamKind.AUDIO, stream_index=stream_index, language=language
-    )
+    selected = select_stream(probe, StreamKind.AUDIO, stream_index=stream_index, language=language)
     if selected is None:
         raise ValueError("输入媒体没有音轨")
     return selected
@@ -190,7 +190,4 @@ def select_audio_stream(
 def select_subtitle_stream(
     probe: MediaProbe, *, stream_index: int | None = None, language: str | None = None
 ) -> MediaStream | None:
-    return select_stream(
-        probe, StreamKind.SUBTITLE, stream_index=stream_index, language=language
-    )
-
+    return select_stream(probe, StreamKind.SUBTITLE, stream_index=stream_index, language=language)

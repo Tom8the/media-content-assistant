@@ -33,9 +33,7 @@ def fuse_timeline(
 
     for group in alignment.groups:
         asr_text = _join_text([asr_by_id[item_id].text for item_id in group.asr_ids])
-        subtitle_text = _join_text(
-            [subtitle_by_id[item_id].text for item_id in group.subtitle_ids]
-        )
+        subtitle_text = _join_text([subtitle_by_id[item_id].text for item_id in group.subtitle_ids])
         has_asr = bool(asr_text)
         has_subtitle = bool(subtitle_text)
         has_hard_subtitle = any(
@@ -51,8 +49,7 @@ def fuse_timeline(
             )
         )
         include_in_transcript = not (
-            is_unmatched_hard_subtitle
-            and not settings.include_unmatched_hard_subtitles
+            is_unmatched_hard_subtitle and not settings.include_unmatched_hard_subtitles
         )
         normalized_lengths = (len(normalize_text(asr_text)), len(normalize_text(subtitle_text)))
         length_ratio = (

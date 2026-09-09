@@ -14,6 +14,7 @@ class TaskStatus(StrEnum):
     SUBTITLE_PROCESSING = "subtitle_processing"
     ALIGNING = "aligning"
     EXPORTING = "exporting"
+    TRANSLATING = "translating"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -48,6 +49,11 @@ class FusionMode(StrEnum):
     VERBATIM = "verbatim"
     SUBTITLE = "subtitle"
     CLEAN = "clean"
+
+
+class ASRMode(StrEnum):
+    LOCAL = "local"
+    API = "api"
 
 
 class MediaStream(BaseModel):
@@ -204,7 +210,12 @@ class TaskManifest(BaseModel):
     work_dir: Path
     output_dir: Path
     mode: FusionMode
+    asr_mode: ASRMode = ASRMode.LOCAL
+    api_language: str | None = None
+    api_hotwords: list[str] = Field(default_factory=list)
     hard_subtitles: bool = False
+    translate_to_chinese: bool = False
+    translation_backend: str | None = None
     selected_audio_stream: int | None = None
     selected_subtitle_stream: int | None = None
     artifacts: dict[str, str] = Field(default_factory=dict)

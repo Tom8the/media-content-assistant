@@ -11,18 +11,12 @@ _CJK_SPACE = re.compile(r"(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])")
 _SPACE_BEFORE_PUNCTUATION = re.compile(r"\s+([，。！？；：、])")
 _SPACE_AFTER_PUNCTUATION = re.compile(r"([，。！？；：、])\s+")
 _LEADING_FILLER = re.compile(r"^(?:嗯+|呃+|额+|啊+)(?:[，、]\s*|\s+)")
-_STANDALONE_FILLER = re.compile(
-    r"(^|[，。！？；：])(?:嗯+|呃+|额+|啊+)(?=$|[，。！？；：])"
-)
-_REPEATED_DISCOURSE = re.compile(
-    r"(然后|就是|这个时候|对不对)(?:[，、\s]+\1)+"
-)
+_STANDALONE_FILLER = re.compile(r"(^|[，。！？；：])(?:嗯+|呃+|额+|啊+)(?=$|[，。！？；：])")
+_REPEATED_DISCOURSE = re.compile(r"(然后|就是|这个时候|对不对)(?:[，、\s]+\1)+")
 _REPEATED_PUNCTUATION = re.compile(r"([，。！？；：])\1+")
 _TERMINAL_PUNCTUATION = ("。", "！", "？")
 _QUESTION_ENDING = re.compile(r"(?:吗|么|呢|是不是|好不好|对不对)$")
-_PUNCTUATION_TRANSLATION = str.maketrans(
-    {",": "，", ";": "；", ":": "：", "?": "？", "!": "！"}
-)
+_PUNCTUATION_TRANSLATION = str.maketrans({",": "，", ";": "；", ":": "：", "?": "？", "!": "！"})
 
 
 @dataclass(frozen=True)

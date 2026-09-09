@@ -58,4 +58,3 @@ def normalize_audio(
     if not target.is_file() or target.stat().st_size <= 44:
         raise AudioExtractionError("FFmpeg 未生成有效 WAV 文件")
     return target
-

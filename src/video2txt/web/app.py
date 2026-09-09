@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
 import shutil
 import tempfile
@@ -16,6 +17,7 @@ from threading import Lock
 from typing import Annotated, Any, Literal
 from uuid import uuid4
 
+import pysubs2
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -24,7 +26,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from video2txt import __version__
 from video2txt.config import Settings, load_settings
-from video2txt.models import FusionMode, TaskManifest, TaskStatus
+from video2txt.models import ASRMode, FusionMode, TaskManifest, TaskStatus
 from video2txt.pipeline import TranscriptionPipeline
 
 MEDIA_EXTENSIONS = {
@@ -41,17 +43,29 @@ MEDIA_EXTENSIONS = {
     ".webm",
 }
 SUBTITLE_EXTENSIONS = {".ass", ".srt", ".ssa", ".vtt"}
-DOWNLOAD_FILES = {"subtitles.srt", "transcript.txt"}
+DOWNLOAD_FILES = {
+    "subtitles.srt",
+    "translated_subtitles_zh.srt",
+    "transcript.txt",
+    "translated_transcript_zh.txt",
+}
 EXPORT_FILES_BY_TYPE = {
     "text": "transcript.txt",
     "subtitle": "subtitles.srt",
+    "translation": "translated_subtitles_zh.srt",
+    "translation_text": "translated_transcript_zh.txt",
 }
 EXPORT_FILES_BY_KIND = {
-    "all": ("transcript.txt", "subtitles.srt"),
+    "all": (
+        "transcript.txt",
+        "subtitles.srt",
+        "translated_subtitles_zh.srt",
+        "translated_transcript_zh.txt",
+    ),
     "subtitle": ("subtitles.srt",),
     "text": ("transcript.txt",),
 }
-ExportType = Literal["subtitle", "text"]
+ExportType = Literal["subtitle", "text", "translation", "translation_text"]
 LegacyExportKind = Literal["all", "subtitle", "text"]
 MAX_UPLOAD_GB = 5
 MAX_UPLOAD_BYTES = MAX_UPLOAD_GB * 1024 * 1024 * 1024
@@ -75,6 +89,28 @@ def _model_display_name(model_path: Path | None) -> str | None:
         if part.startswith("faster-whisper-"):
             return part
     return model_path.name
+
+
+def _translation_models_available(settings: Settings) -> bool:
+    model_dir = settings.translation.model_path
+    return (model_dir / "model.bin").is_file() and (model_dir / "sentencepiece.bpe.model").is_file()
+
+
+def _api_pipeline_available(settings: Settings) -> bool:
+    return bool(
+        os.getenv(settings.qwen_asr.api_key_environment, "").strip()
+        and importlib.util.find_spec("requests")
+        and shutil.which(settings.codex_translation.command)
+    )
+
+
+def _parse_api_hotwords(value: str) -> list[str]:
+    words = list(dict.fromkeys(word.strip() for word in value.splitlines() if word.strip()))
+    if len(words) > 2000:
+        raise HTTPException(status_code=400, detail="API çƒ­è¯æœ€å¤š 2000 ä¸ª")
+    if any(len(word) > 200 for word in words):
+        raise HTTPException(status_code=400, detail="API çƒ­è¯å•æ¡ä¸èƒ½è¶…è¿‡ 200 ä¸ªå­—ç¬¦")
+    return words
 
 
 def _validate_id(value: str, label: str) -> str:
@@ -157,8 +193,30 @@ def _media_stem(task: dict[str, Any]) -> str:
 
 
 def _export_filename(task: dict[str, Any], internal_name: str) -> str:
+    if internal_name == "translated_subtitles_zh.srt":
+        return f"{_media_stem(task)}.zh.srt"
+    if internal_name == "translated_transcript_zh.txt":
+        return f"{_media_stem(task)}.zh.txt"
     suffix = ".srt" if internal_name == "subtitles.srt" else ".txt"
     return f"{_media_stem(task)}{suffix}"
+
+
+def _backfill_translated_text(manifest: TaskManifest) -> None:
+    """Create the Chinese TXT once for completed tasks made before this output existed."""
+    target = manifest.output_dir / "translated_transcript_zh.txt"
+    source = manifest.output_dir / "translated_subtitles_zh.srt"
+    if target.is_file() or not source.is_file():
+        return
+    temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
+    try:
+        subtitles = pysubs2.load(str(source), encoding="utf-8")
+        content = "\n".join(
+            event.plaintext.strip() for event in subtitles.events if event.plaintext.strip()
+        )
+        temporary.write_text(content + ("\n" if content else ""), encoding="utf-8")
+        temporary.replace(target)
+    except (OSError, UnicodeError, ValueError):
+        temporary.unlink(missing_ok=True)
 
 
 def _selected_export_files(
@@ -217,6 +275,9 @@ def _run_pipeline_job(
             original_filename=str(job["original_filename"]),
             batch_id=str(job["batch_id"]) if job.get("batch_id") else None,
             hard_subtitles=bool(job.get("hard_subtitles")),
+            translate_to_chinese=bool(job.get("translate_to_chinese")),
+            asr_mode=ASRMode(str(job.get("asr_mode") or ASRMode.LOCAL)),
+            api_hotwords=[str(item) for item in (job.get("api_hotwords") or [])],
         )
     except Exception as error:
         return str(error)
@@ -245,6 +306,8 @@ async def _save_upload(upload: UploadFile, target: Path) -> int:
 
 
 def _manifest_payload(manifest: TaskManifest) -> dict[str, Any]:
+    if manifest.status == TaskStatus.COMPLETED:
+        _backfill_translated_text(manifest)
     payload = manifest.model_dump(mode="json")
     if manifest.input_path.is_file():
         payload["media_size"] = manifest.input_path.stat().st_size
@@ -322,9 +385,7 @@ def create_app(
         ):
             manifest_path = root / safe_task_id / "task.json"
             if manifest_path.is_file():
-                return TaskManifest.model_validate_json(
-                    manifest_path.read_text(encoding="utf-8")
-                )
+                return TaskManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
         return None
 
     def task_payload(task_id: str) -> dict[str, Any]:
@@ -346,9 +407,7 @@ def create_app(
         job = {
             **queued,
             "media_path": str(media_path.resolve()),
-            "subtitle_path": str(subtitle_path.resolve())
-            if subtitle_path is not None
-            else None,
+            "subtitle_path": str(subtitle_path.resolve()) if subtitle_path is not None else None,
             "mode": mode.value,
         }
         _write_json_atomic(
@@ -421,6 +480,569 @@ def create_app(
                         "status",
                         "mode",
                         "hard_subtitles",
+                        "translate_to_chinese",
+                        "asr_mode",
+                        "api_language",
+                        "api_hotwords",
                         "original_filename",
                         "media_size",
-                        "warnings",Û_6¶‰Ëkºwµç@€€€€€€€€€€€¤(€€€€€€€€€€€€€€€•á•ÁĞ€¡=MÉÉ½È°Y…±Õ•ÉÉ½È¤è(€€€€€€€€€€€€€€€€€€€½¹Ñ¥¹Õ”(€€€€€€€€€€€€€€€µ…¹¥™•ÍÑÍmµ…¹¥™•ÍĞ¹Ñ…Í­}¥‘t€ôµ…¹¥™•ÍĞ(€€€€€€€¥˜…¹ä¡µ…¹¥™•ÍĞ¹ÍÑ…ÑÕÌ¹½Ğ¥¸QI5%91}MQQUML™½Èµ…¹¥™•ÍĞ¥¸µ…¹¥™•ÍÑÌ¹Ù…±Õ•Ì ¤¤è(€€€€€€€€€€€É…¥Í”!QQAá•ÁÑ¥½¸¡ÍÑ…ÑÕÍ}½‘”ôĞÀä°‘•Ñ…¥°ô‹šr'’îï–*‡š¶–r£¢şC¢†3¾ò3šj’â7¢÷šâ¦ë–£¦£’îï–*„ˆ¤((€€€€€€€™É••‘}‰åÑ•Ì€ô€À(€€€€€€€™½È¡¥±¥¸±¥ÍĞ¡½ÕÑÁÕÑ}É½½Ğ¹¥Ñ•É‘¥È ¤¤¥˜½ÕÑÁÕÑ}É½½Ğ¹¥Í}‘¥È ¤•±Í”mtè(€€€€€€€€€€€™É••‘}‰åÑ•Ì€¬ô}É•µ½Ù•}¡¥±‘}Á…Ñ ¡½ÕÑÁÕÑ}É½½Ğ°¡¥±¤(€€€€€€€™½Èµ…¹¥™•ÍĞ¥¸µ…¹¥™•ÍÑÌ¹Ù…±Õ•Ì ¤è(€€€€€€€€€€€™É••‘}‰åÑ•Ì€¬ô}É•µ½Ù•}¡¥±‘}Á…Ñ ¡İ½É­}É½½Ğ°İ½É­}É½½Ğ€¼µ…¹¥™•ÍĞ¹Ñ…Í­}¥¤(€€€€€€€€€€€É•¥ÍÑÉä¹É•µ½Ù”¡µ…¹¥™•ÍĞ¹Ñ…Í­}¥¤(€€€€€€€™½Èµ…¹…•‘}¹…µ”¥¸€ ‰ÕÁ±½…‘Ìˆ°€‰‰…Ñ¡•Ìˆ¤è(€€€€€€€€€€€µ…¹…•‘}É½½Ğ€ôİ½É­}É½½Ğ€¼µ…¹…•‘}¹…µ”(€€€€€€€€€€€¥˜¹½Ğµ…¹…•‘}É½½Ğ¹¥Í}‘¥È ¤è(€€€€€€€€€€€€€€€½¹Ñ¥¹Õ”(€€€€€€€€€€€™½È¡¥±¥¸±¥ÍĞ¡µ…¹…•‘}É½½Ğ¹¥Ñ•É‘¥È ¤¤è(€€€€€€€€€€€€€€€™É••‘}‰åÑ•Ì€¬ô}É•µ½Ù•}¡¥±‘}Á…Ñ ¡µ…¹…•‘}É½½Ğ°¡¥±¤((€€€€€€€É•ÑÕÉ¸ì(€€€€€€€€€€€€‰±•…É•‘}Ñ…Í­Ìˆè±•¸¡µ…¹¥™•ÍÑÌ¤°(€€€€€€€€€€€€‰™É••‘}‰åÑ•Ìˆè™É••‘}‰åÑ•Ì°(€€€€€€€€€€€€¨©ÍÑ½É…•}Á…å±½… ¤°(€€€€€€€ô((€€€…ÁÀ¹•Ğ ˆ½…Á¤½Ñ…Í­Ì½íÑ…Í­}¥‘ôˆ¤(€€€‘•˜•Ñ}Ñ…Í¬¡Ñ…Í­}¥èÍÑÈ¤€´ø‘¥ÑmÍÑÈ°¹åtè(€€€€€€€É•ÑÕÉ¸Ñ…Í­}Á…å±½…¡Ñ…Í­}¥¤((€€€…ÁÀ¹Á½ÍĞ ˆ½…Á¤½Ñ…Í­Ì½íÑ…Í­}¥‘ô½É•ÑÉäˆ°ÍÑ…ÑÕÍ}½‘”ôÈÀÈ¤(€€€‘•˜É•ÑÉå}Ñ…Í¬¡Ñ…Í­}¥èÍÑÈ¤€´ø‘¥ÑmÍÑÈ°¹åtè(€€€€€€€µ…¹¥™•ÍĞ€ô±½…‘}Ñ…Í­}µ…¹¥™•ÍĞ¡Ñ…Í­}¥¤(€€€€€€€¥˜µ…¹¥™•ÍĞ¥Ì9½¹”è(€€€€€€€€€€€É…¥Í”!QQAá•ÁÑ¥½¸¡ÍÑ…ÑÕÍ}½‘”ôĞÀĞ°‘•Ñ…¥°ô‹’îï–*‡’â7–¶c–r ˆ¤(€€€€€€€¥˜µ…¹¥™•ÍĞ¹ÍÑ…ÑÕÌ€„ôQ…Í­MÑ…ÑÕÌ¹%1è(€€€€€€€€€€€É…¥Í”!QQAá•ÁÑ¥½¸¡ÍÑ…ÑÕÍ}½‘”ôĞÀä°‘•Ñ…¥°ô‹–>«šr'–’Ç¢Ò—’îï–*‡–>¿’î—¦7¢¾Tˆ¤(€€€€€€€¥˜¹½Ğµ…¹¥™•ÍĞ¹¥¹ÁÕÑ}Á…Ñ ¹¥Í}™¥±” ¤è(€€€€€€€€€€€É…¥Í”!QQAá•ÁÑ¥½¸¡ÍÑ…ÑÕÍ}½‘”ôĞÀä°‘•Ñ…¥°ô‹–:–/’â+’òƒšZ’îÛ–ŞË¢Š¯šâB¾ò3š^ƒšÎW¦7¢¾Tˆ¤((€€€€€€€‰…Ñ¡}¥€ôÕÕ¥Ğ ¤¹¡•à(€€€€€€€¹•İ}Ñ…Í­}¥€ôÕÕ¥Ğ ¤¹¡•à(€€€€€€€ÕÁ±½…‘}‘¥È€ô€ (€€€€€€€€€€€É•Í½±Ù•‘}Í•ÑÑ¥¹Ì¹Á…Ñ¡Ì¹İ½É­}‘¥È¹É•Í½±Ù” ¤(€€€€€€€€€€€€¼€‰ÕÁ±½…‘Ìˆ(€€€€€€€€€€€€¼‰…Ñ¡}¥(€€€€€€€€€€€€¼¹•İ}Ñ…Í­}¥(€€€€€€€€¤(€€€€€€€µ•‘¥…}Á…Ñ €ôÕÁ±½…‘}‘¥È€¼˜‰Í½ÕÉ•íµ…¹¥™•ÍĞ¹¥¹ÁÕÑ}Á…Ñ ¹ÍÕ™™¥à¹±½İ•È ¥ôˆ(€€€€€€€ÍÕ‰Ñ¥Ñ±•}Ù…±Õ”€ôµ…¹¥™•ÍĞ¹…ÉÑ¥™…ÑÌ¹•Ğ ‰ÍÕ‰Ñ¥Ñ±•}Í½ÕÉ”ˆ¤(€€€€€€€ÍÕ‰Ñ¥Ñ±•}Í½ÕÉ”€ôA…Ñ ¡ÍÕ‰Ñ¥Ñ±•}Ù…±Õ”¤¥˜ÍÕ‰Ñ¥Ñ±•}Ù…±Õ”•±Í”9½¹”(€€€€€€€ÍÕ‰Ñ¥Ñ±•}Á…Ñ èA…Ñ ğ9½¹”€ô9½¹”(€€€€€€€ÑÉäè(€€€€€€€€€€€ÕÁ±½…‘}‘¥È¹µ­‘¥È¡Á…É•¹ÑÌõQÉÕ”°•á¥ÍÑ}½¬õQÉÕ”¤(€€€€€€€€€€€Í¡ÕÑ¥°¹½ÁäÈ¡µ…¹¥™•ÍĞ¹¥¹ÁÕÑ}Á…Ñ °µ•‘¥…}Á…Ñ ¤(€€€€€€€€€€€¥˜ÍÕ‰Ñ¥Ñ±•}Í½ÕÉ”¥Ì¹½Ğ9½¹”…¹ÍÕ‰Ñ¥Ñ±•}Í½ÕÉ”¹¥Í}™¥±” ¤è(€€€€€€€€€€€€€€€ÍÕ‰Ñ¥Ñ±•}Á…Ñ €ôÕÁ±½…‘}‘¥È€¼˜‰ÍÕ‰Ñ¥Ñ±•íÍÕ‰Ñ¥Ñ±•}Í½ÕÉ”¹ÍÕ™™¥à¹±½İ•È ¥ôˆ(€€€€€€€€€€€€€€€Í¡ÕÑ¥°¹½ÁäÈ¡ÍÕ‰Ñ¥Ñ±•}Í½ÕÉ”°ÍÕ‰Ñ¥Ñ±•}Á…Ñ ¤(€€€€€€€•á•ÁĞá•ÁÑ¥½¸è(€€€€€€€€€€€}É•µ½Ù•}¡¥±‘}Á…Ñ  (€€€€€€€€€€€€€€€É•Í½±Ù•‘}Í•ÑÑ¥¹Ì¹Á…Ñ¡Ì¹İ½É­}‘¥È¹É•Í½±Ù” ¤°(€€€€€€€€€€€€€€€É•Í½±Ù•‘}Í•ÑÑ¥¹Ì¹Á…Ñ¡Ì¹İ½É­}‘¥È¹É•Í½±Ù” ¤€¼€‰ÕÁ±½…‘Ìˆ€¼‰…Ñ¡}¥°(€€€€€€€€€€€€¤(€€€€€€€€€€€É…¥Í”((€€€€€€€ÅÕ•Õ•€ôì(€€€€€€€€€€€€‰Ñ…Í­}¥ˆè¹•İ}Ñ…Í­}¥°(€€€€€€€€€€€€‰‰…Ñ¡}¥ˆè‰…Ñ¡}¥°(€€€€€€€€€€€€‰ÍÑ…ÑÕÌˆè€‰ÅÕ•Õ•ˆ°(€€€€€€€€€€€€‰µ½‘”ˆèµ…¹¥™•ÍĞ¹µ½‘”¹Ù…±Õ”°(€€€€€€€€€€€€‰¡…É‘}ÍÕ‰Ñ¥Ñ±•Ìˆèµ…¹¥™•ÍĞ¹¡…É‘}ÍÕ‰Ñ¥Ñ±•Ì°(€€€€€€€€€€€€‰½É¥¥¹…±}™¥±•¹…µ”ˆèµ…¹¥™•ÍĞ¹½É¥¥¹…±}™¥±•¹…µ”(€€€€€€€€€€€½Èµ…¹¥™•ÍĞ¹¥¹ÁÕÑ}Á…Ñ ¹¹…µ”°(€€€€€€€€€€€€‰µ•‘¥…}Í¥é”ˆèµ•‘¥…}Á…Ñ ¹ÍÑ…Ğ ¤¹ÍÑ}Í¥é”°(€€€€€€€€€€€€‰İ…É¹¥¹Ìˆèmt°(€€€€€€€€€€€€‰•ÉÉ½Èˆè9½¹”°(€€€€€€€ô(€€€€€€€‰…Ñ €ôì(€€€€€€€€€€€€‰‰…Ñ¡}¥ˆè‰…Ñ¡}¥°(€€€€€€€€€€€€‰µ½‘”ˆèµ…¹¥™•ÍĞ¹µ½‘”¹Ù…±Õ”°(€€€€€€€€€€€€‰¡…É‘}ÍÕ‰Ñ¥Ñ±•Ìˆèµ…¹¥™•ÍĞ¹¡…É‘}ÍÕ‰Ñ¥Ñ±•Ì°(€€€€€€€€€€€€‰É•…Ñ•‘}…Ğˆè‘…Ñ•Ñ¥µ”¹¹½Ü ¤¹…ÍÑ¥µ•é½¹” ¤¹¥Í½™½Éµ…Ğ¡Ñ¥µ•ÍÁ•Œô‰Í•½¹‘Ìˆ¤°(€€€€€€€€€€€€‰Ñ…Í­}¥‘Ìˆèm¹•İ}Ñ…Í­}¥‘t°(€€€€€€€ô(€€€€€€€}İÉ¥Ñ•}‰…Ñ¡}µ…¹¥™•ÍĞ¡É•Í½±Ù•‘}Í•ÑÑ¥¹Ì°‰…Ñ ¤(€€€€€€€ÍÕ‰µ¥Ñ}Ñ…Í¬¡ÅÕ•Õ•°µ•‘¥…}Á…Ñ °ÍÕ‰Ñ¥Ñ±•}Á…Ñ °µ…¹¥™•ÍĞ¹µ½‘”¤(€€€€€€€É•ÑÕÉ¸ì¨©‰…Ñ °€‰Ñ…Í­ÌˆèmÅÕ•Õ•‘uô((€€€…ÁÀ¹‘•±•Ñ” ˆ½…Á¤½Ñ…Í­Ì½íÑ…Í­}¥‘ôˆ¤(€€€‘•˜‘•±•Ñ•}Ñ…Í¬¡Ñ…Í­}¥èÍÑÈ¤€´ø‘¥ÑmÍÑÈ°¹åtè(€€€€€€€Á…å±½…€ôÑ…Í­}Á…å±½…¡Ñ…Í­}¥¤(€€€€€€€ÑÉäè(€€€€€€€€€€€ÍÑ…ÑÕÌ€ôQ…Í­MÑ…ÑÕÌ¡Á…å±½…‘l‰ÍÑ…ÑÕÌ‰t¤(€€€€€€€•á•ÁĞY…±Õ•ÉÉ½È…Ì•ÉÉ½Èè(€€€€€€€€€€€É…¥Í”!QQAá•ÁÑ¥½¸¡ÍÑ…ÑÕÍ}½‘”ôĞÀä°‘•Ñ…¥°ô‹’îï–*‡*Ûšš^ƒšV ˆ¤™É½´•ÉÉ½È(€€€€€€€¥˜ÍÑ…ÑÕÌ¹½Ğ¥¸QI5%91}MQQUMLè(€€€€€€€€€€€É…¥Í”!QQAá•ÁÑ¥½¸¡ÍÑ…ÑÕÍ}½‘”ôĞÀä°‘•Ñ…¥°ô‹¢şC¢†3’â·j’îï–*‡’â7¢÷–"ƒ¦fˆ¤((€€€€€€€Í…™•}Ñ…Í­}¥€ô}Ù…±¥‘…Ñ•}¥¡Ñ…Í­}¥°€‹’îï–*„ˆ¤(€€€€€€€İ½É­}É½½Ğ€ôÉ•Í½±Ù•‘}Í•ÑÑ¥¹Ì¹Á…Ñ¡Ì¹İ½É­}‘¥È¹É•Í½±Ù” ¤(€€€€€€€½ÕÑÁÕÑ}É½½Ğ€ôÉ•Í½±Ù•‘}Í•ÑÑ¥¹Ì¹Á…Ñ¡Ì¹½ÕÑÁÕÑ}‘¥È¹É•Í½±Ù” ¤(€€€€€€€‰…Ñ¡}¥€ôÁ…å±½…¹•Ğ ‰‰…Ñ¡}¥ˆ¤(€€€€€€€™É••‘}‰åÑ•Ì€ô€À(€€€€€€€™½ÈÑ…É•Ğ°É½½Ğ¥¸€ (€€€€€€€€€€€€¡İ½É­}É½½Ğ€¼Í…™•}Ñ…Í­}¥°İ½É­}É½½Ğ¤°(€€€€€€€€€€€€¡½ÕÑÁÕÑ}É½½Ğ€¼Í…™•}Ñ…Í­}¥°½ÕÑÁÕÑ}É½½Ğ¤°(€€€€€€€€¤è(€€€€€€€€€€€™É••‘}‰åÑ•Ì€¬ô}É•µ½Ù•}¡¥±‘}Á…Ñ ¡É½½Ğ°Ñ…É•Ğ¤(€€€€€€€ÕÁ±½…‘}É½ÕÀ€ôÍÑÈ¡‰…Ñ¡}¥½ÈÍ…™•}Ñ…Í­}¥¤(€€€€€€€™É••‘}‰åÑ•Ì€¬ô}É•µ½Ù•}¡¥±‘}Á…Ñ  (€€€€€€€€€€€İ½É­}É½½Ğ°(€€€€€€€€€€€İ½É­}É½½Ğ€¼€‰ÕÁ±½…‘Ìˆ€¼ÕÁ±½…‘}É½ÕÀ€¼Í…™•}Ñ…Í­}¥°(€€€€€€€€¤(€€€€€€€}Ñ…Í­}©½‰}Á…Ñ ¡É•Í½±Ù•‘}Í•ÑÑ¥¹Ì°Í…™•}Ñ…Í­}¥¤¹Õ¹±¥¹¬¡µ¥ÍÍ¥¹}½¬õQÉÕ”¤(€€€€€€€É•¥ÍÑÉä¹É•µ½Ù”¡Í…™•}Ñ…Í­}¥¤((€€€€€€€¥˜‰…Ñ¡}¥è(€€€€€€€€€€€‰…Ñ¡}Á…Ñ €ô}‰…Ñ¡}µ…¹¥™•ÍÑ}Á…Ñ  (€€€€€€€€€€€€€€€É•Í½±Ù•‘}Í•ÑÑ¥¹Ì°}Ù…±¥‘…Ñ•}¥¡ÍÑÈ¡‰…Ñ¡}¥¤°€‹š&çš²„ˆ¤(€€€€€€€€€€€€¤(€€€€€€€€€€€¥˜‰…Ñ¡}Á…Ñ ¹¥Í}™¥±” ¤è(€€€€€€€€€€€€€€€‰…Ñ €ô©Í½¸¹±½…‘Ì¡‰…Ñ¡}Á…Ñ ¹É•…‘}Ñ•áĞ¡•¹½‘¥¹œô‰ÕÑ˜´àˆ¤¤(€€€€€€€€€€€€€€€‰…Ñ¡l‰Ñ…Í­}¥‘Ì‰t€ôl(€€€€€€€€€€€€€€€€€€€¥Ñ•´™½È¥Ñ•´¥¸‰…Ñ ¹•Ğ ‰Ñ…Í­}¥‘Ìˆ°mt¤¥˜¥Ñ•´€„ôÍ…™•}Ñ…Í­}¥(€€€€€€€€€€€€€€€t(€€€€€€€€€€€€€€€¥˜‰…Ñ¡l‰Ñ…Í­}¥‘Ì‰tè(€€€€€€€€€€€€€€€€€€€}İÉ¥Ñ•}‰…Ñ¡}µ…¹¥™•ÍĞ¡É•Í½±Ù•‘}Í•ÑÑ¥¹Ì°‰…Ñ ¤(€€€€€€€€€€€€€€€•±Í”è(€€€€€€€€€€€€€€€€€€€‰…Ñ¡}Á…Ñ ¹Õ¹±¥¹¬¡µ¥ÍÍ¥¹}½¬õQÉÕ”¤(€€€€€€€É•ÑÕÉ¸ì‰Ñ…Í­}¥ˆèÍ…™•}Ñ…Í­}¥°€‰™É••‘}‰åÑ•Ìˆè™É••‘}‰åÑ•Ì°€¨©ÍÑ½É…•}Á…å±½… ¥ô((€€€…ÁÀ¹•Ğ ˆ½…Á¤½Ñ…Í­Ì½íÑ…Í­}¥‘ô½™¥±•Ì½í™¥±•¹…µ•ôˆ¤(€€€‘•˜‘½İ¹±½…‘}Ñ…Í­}™¥±”¡Ñ…Í­}¥èÍÑÈ°™¥±•¹…µ”èÍÑÈ¤€´ø¥±•I•ÍÁ½¹Í”è(€€€€€€€¥˜™¥±•¹…µ”¹½Ğ¥¸=]91=}%1Lè(€€€€€€€€€€€É…¥Í”!QQAá•ÁÑ¥½¸¡ÍÑ…ÑÕÍ}½‘”ôĞÀĞ°‘•Ñ…¥°ô‹šZ’îÛ’â7–¶c–r ˆ¤(€€€€€€€Í…™•}Ñ…Í­}¥€ô}Ù…±¥‘…Ñ•}¥¡Ñ…Í­}¥°€‹’îï–*„ˆ¤(€€€€€€€Ñ…É•Ğ€ôÉ•Í½±Ù•‘}Í•ÑÑ¥¹Ì¹Á…Ñ¡Ì¹½ÕÑÁÕÑ}‘¥È¹É•Í½±Ù” ¤€¼Í…™•}Ñ…Í­}¥€¼™¥±•¹…µ”(€€€€€€€¥˜¹½ĞÑ…É•Ğ¹¥Í}™¥±” ¤è(€€€€€€€€€€€É…¥Í”!QQAá•ÁÑ¥½¸¡ÍÑ…ÑÕÍ}½‘”ôĞÀĞ°‘•Ñ…¥°ô‹šZ’îÛ’â7–¶c–r ˆ¤(€€€€€€€Ñ…Í¬€ôÑ…Í­}Á…å±½…¡Í…™•}Ñ…Í­}¥¤(€€€€€€€É•ÑÕÉ¸¥±•I•ÍÁ½¹Í”¡Ñ…É•Ğ°™¥±•¹…µ”õ}•áÁ½ÉÑ}™¥±•¹…µ”¡Ñ…Í¬°™¥±•¹…µ”¤¤((€€€…ÁÀ¹•Ğ ˆ½…Á¤½Ñ…Í­Ì½íÑ…Í­}¥‘ô½•áÁ½ÉĞˆ¤(€€€‘•˜•áÁ½ÉÑ}Ñ…Í¬ (€€€€€€€Ñ…Í­}¥èÍÑÈ°(€€€€€€€ÑåÁ•Ìè¹¹½Ñ…Ñ•‘m±¥ÍÑmáÁ½ÉÑQåÁ•tğ9½¹”°EÕ•Éä ¥t€ô9½¹”°(€€€€€€€­¥¹è1•…åáÁ½ÉÑ-¥¹ğ9½¹”€ô9½¹”°(€€€€¤€´ø¥±•I•ÍÁ½¹Í”è(€€€€€€€Ñ…Í¬€ôÑ…Í­}Á…å±½…¡Ñ…Í­}¥¤(€€€€€€€¥˜Ñ…Í­l‰ÍÑ…ÑÕÌ‰t€„ô€‰½µÁ±•Ñ•ˆè(€€€€€€€€€€€É…¥Í”!QQAá•ÁÑ¥½¸¡ÍÑ…ÑÕÍ}½‘”ôĞÀä°‘•Ñ…¥°ô‹’îï–*‡–Âkšr«–º3š"@ˆ¤(€€€€€€€½ÕÑÁÕÑ}‘¥È€ôÉ•Í½±Ù•‘}Í•ÑÑ¥¹Ì¹Á…Ñ¡Ì¹½ÕÑÁÕÑ}‘¥È¹É•Í½±Ù” ¤€¼Ñ…Í­l‰Ñ…Í­}¥‰t(€€€€€€€Í•±•Ñ•€ô}Í•±•Ñ•‘}•áÁ½ÉÑ}™¥±•Ì¡ÑåÁ•Ì°­¥¹¤(€€€€€€€…Ù…¥±…‰±”€ôm¹…µ”™½È¹…µ”¥¸Í•±•Ñ•¥˜€¡½ÕÑÁÕÑ}‘¥È€¼¹…µ”¤¹¥Í}™¥±” ¥t(€€€€€€€¥˜±•¸¡…Ù…¥±…‰±”¤€„ô±•¸¡Í•±•Ñ•¤è(€€€€€€€€€€€É…¥Í”!QQAá•ÁÑ¥½¸¡ÍÑ…ÑÕÍ}½‘”ôĞÀĞ°‘•Ñ…¥°ô‹š&¦'Æï–z/jšZ’îÛ’â7–¶c–r ˆ¤(€€€€€€€¥˜¹½Ğ…Ù…¥±…‰±”è(€€€€€€€€€€€É…¥Í”!QQAá•ÁÑ¥½¸¡ÍÑ…ÑÕÍ}½‘”ôĞÀĞ°‘•Ñ…¥°ô‹šÊ‡šr'–>¿’â/¢ö÷jšZ’îØˆ¤(€€€€€€€¥˜±•¸¡Í•±•Ñ•¤€ôô€Äè(€€€€€€€€€€€¥¹Ñ•É¹…±}¹…µ”€ô…Ù…¥±…‰±•lÁt(€€€€€€€€€€€É•ÑÕÉ¸¥±•I•ÍÁ½¹Í” (€€€€€€€€€€€€€€€½ÕÑÁÕÑ}‘¥È€¼¥¹Ñ•É¹…±}¹…µ”°(€€€€€€€€€€€€€€€™¥±•¹…µ”õ}•áÁ½ÉÑ}™¥±•¹…µ”¡Ñ…Í¬°¥¹Ñ•É¹…±}¹…µ”¤°(€€€€€€€€€€€€¤((€€€€€€€•áÁ½ÉÑ}‘¥È€ôÉ•Í½±Ù•‘}Í•ÑÑ¥¹Ì¹Á…Ñ¡Ì¹İ½É­}‘¥È¹É•Í½±Ù” ¤€¼€‰•áÁ½ÉÑÌˆ(€€€€€€€•áÁ½ÉÑ}‘¥È¹µ­‘¥È¡Á…É•¹ÑÌõQÉÕ”°•á¥ÍÑ}½¬õQÉÕ”¤(€€€€€€€…É¡¥Ù•}Á…Ñ €ô•áÁ½ÉÑ}‘¥È€¼˜‰íÑ…Í­lÑ…Í­}¥uôµíÕÕ¥Ğ ¤¹¡•áô¹é¥Àˆ(€€€€€€€İ¥Ñ é¥Á™¥±”¹i¥Á¥±” (€€€€€€€€€€€…É¡¥Ù•}Á…Ñ °€‰Üˆ°½µÁÉ•ÍÍ¥½¸õé¥Á™¥±”¹i%A}1Q(€€€€€€€€¤…Ì…É¡¥Ù”è(€€€€€€€€€€€™½È¥¹Ñ•É¹…±}¹…µ”¥¸…Ù…¥±…‰±”è(€€€€€€€€€€€€€€€…É¡¥Ù”¹İÉ¥Ñ” (€€€€€€€€€€€€€€€€€€€½ÕÑÁÕÑ}‘¥È€¼¥¹Ñ•É¹…±}¹…µ”°(€€€€€€€€€€€€€€€€€€€}•áÁ½ÉÑ}™¥±•¹…µ”¡Ñ…Í¬°¥¹Ñ•É¹…±}¹…µ”¤°(€€€€€€€€€€€€€€€€¤(€€€€€€€É•ÑÕÉ¸¥±•I•ÍÁ½¹Í” (€€€€€€€€€€€…É¡¥Ù•}Á…Ñ °(€€€€€€€€€€€µ•‘¥…}ÑåÁ”ô‰…ÁÁ±¥…Ñ¥½¸½é¥Àˆ°(€€€€€€€€€€€™¥±•¹…µ”õ˜‰í}µ•‘¥…}ÍÑ•´¡Ñ…Í¬¥ô¹é¥Àˆ°(€€€€€€€€€€€‰…­É½Õ¹õ	…­É½Õ¹‘Q…Í¬¡…É¡¥Ù•}Á…Ñ ¹Õ¹±¥¹¬°µ¥ÍÍ¥¹}½¬õQÉÕ”¤°(€€€€€€€€¤((€€€…ÁÀ¹Á½ÍĞ ˆ½…Á¤½Ñ…Í­Ìˆ°ÍÑ…ÑÕÍ}½‘”ôÈÀÈ¤(€€€…Íå¹Œ‘•˜É•…Ñ•}Ñ…Í¬ (€€€€€€€µ•‘¥„è¹¹½Ñ…Ñ•‘mUÁ±½…‘¥±”°¥±” ¥t°(€€€€€€€ÍÕ‰Ñ¥Ñ±”è¹¹½Ñ…Ñ•‘mUÁ±½…‘¥±”ğ9½¹”°¥±” ¥t€ô9½¹”°(€€€€€€€µ½‘”è¹¹½Ñ…Ñ•‘mÕÍ¥½¹5½‘”°½É´ ¥t€ôÕÍ¥½¹5½‘”¹YI	Q%4°(€€€€€€€¡…É‘}ÍÕ‰Ñ¥Ñ±•Ìè¹¹½Ñ…Ñ•‘m‰½½°°½É´ ¥t€ô…±Í”°(€€€€¤€´ø‘¥ÑmÍÑÈ°¹åtè(€€€€€€€µ½‘•±}Á…Ñ €ôÉ•Í½±Ù•‘}Í•ÑÑ¥¹Ì¹…ÍÈ¹µ½‘•±}Á…Ñ (€€€€€€€¥˜µ½‘•±}Á…Ñ ¥Ì9½¹”½È¹½Ğµ½‘•±}Á…Ñ ¹¥Í}‘¥È ¤è(€€€€€€€€€€€É…¥Í”!QQAá•ÁÑ¥½¸¡ÍÑ…ÑÕÍ}½‘”ôÔÀÌ°‘•Ñ…¥°ô‹šr³–rÀMHƒš¢‡–z/–Âkšr«¦7ö¸ˆ¤((€€€€€€€ÅÕ•Õ•°µ•‘¥…}Á…Ñ °ÍÕ‰Ñ¥Ñ±•}Á…Ñ €ô…İ…¥ĞÁÉ•Á…É•}Ñ…Í¬ (€€€€€€€€€€€µ•‘¥„°ÍÕ‰Ñ¥Ñ±”°µ½‘”°¡…É‘}ÍÕ‰Ñ¥Ñ±•Ìõ¡…É‘}ÍÕ‰Ñ¥Ñ±•Ì(€€€€€€€€¤(€€€€€€€ÍÕ‰µ¥Ñ}Ñ…Í¬¡ÅÕ•Õ•°µ•‘¥…}Á…Ñ °ÍÕ‰Ñ¥Ñ±•}Á…Ñ °µ½‘”¤(€€€€€€€É•ÑÕÉ¸ÅÕ•Õ•((€€€…ÁÀ¹Á½ÍĞ ˆ½…Á¤½‰…Ñ¡•Ìˆ°ÍÑ…ÑÕÍ}½‘”ôÈÀÈ¤(€€€…Íå¹Œ‘•˜É•…Ñ•}‰…Ñ  (€€€€€€€µ•‘¥„è¹¹½Ñ…Ñ•‘m±¥ÍÑmUÁ±½…‘¥±•t°¥±” ¥t°(€€€€€€€ÍÕ‰Ñ¥Ñ±•Ìè¹¹½Ñ…Ñ•‘m±¥ÍÑmUÁ±½…‘¥±”ğÍÑÉtğ9½¹”°¥±” ¥t€ô9½¹”°(€€€€€€€µ½‘”è¹¹½Ñ…Ñ•‘mÕÍ¥½¹5½‘”°½É´ ¥t€ôÕÍ¥½¹5½‘”¹YI	Q%4°(€€€€€€€¡…É‘}ÍÕ‰Ñ¥Ñ±•Ìè¹¹½Ñ…Ñ•‘m‰½½°°½É´ ¥t€ô…±Í”°(€€€€¤€´ø‘¥ÑmÍÑÈ°¹åtè(€€€€€€€µ½‘•±}Á…Ñ €ôÉ•Í½±Ù•‘}Í•ÑÑ¥¹Ì¹…ÍÈ¹µ½‘•±}Á…Ñ (€€€€€€€¥˜µ½‘•±}Á…Ñ ¥Ì9½¹”½È¹½Ğµ½‘•±}Á…Ñ ¹¥Í}‘¥È ¤è(€€€€€€€€€€€É…¥Í”!QQAá•ÁÑ¥½¸¡ÍÑ…ÑÕÍ}½‘”ôÔÀÌ°‘•Ñ…¥°ô‹šr³–rÀMHƒš¢‡–z/–Âkšr«¦7ö¸ˆ¤(€€€€€€€¥˜¹½Ğµ•‘¥„è(€€€€€€€€€€€É…¥Í”!QQAá•ÁÑ¥½¸¡ÍÑ…ÑÕÍ}½‘”ôĞÀÀ°‘•Ñ…¥°ô‹¢¾ß¢Ï–ÂG’â+’òƒ’â’â«–ªK’öOšZ’îØˆ¤(€€€€€€€¥˜±•¸¡µ•‘¥„¤€ø5a}	Q!}%1Lè(€€€€€€€€€€€É…¥Í”!QQAá•ÁÑ¥½¸¡ÍÑ…ÑÕÍ}½‘”ôĞÀÀ°‘•Ñ…¥°õ˜‹–6Wš&çšr–’hí5a}	Q!}%1Môƒ’â«–ªK’öOšZ’îØˆ¤(€€€€€€€ÍÕ‰Ñ¥Ñ±•}ÕÁ±½…‘Ìè±¥ÍÑmUÁ±½…‘¥±•t€ômt(€€€€€€€™½ÈÕÁ±½…¥¸ÍÕ‰Ñ¥Ñ±•Ì½Èmtè(€€€€€€€€€€€¥˜¥Í¥¹ÍÑ…¹”¡ÕÁ±½…°ÍÑÈ¤è(€€€€€€€€€€€€€€€½¹Ñ¥¹Õ”(€€€€€€€€€€€¥˜ÕÁ±½…¹™¥±•¹…µ”è(€€€€€€€€€€€€€€€ÍÕ‰Ñ¥Ñ±•}ÕÁ±½…‘Ì¹…ÁÁ•¹¡ÕÁ±½…¤(€€€€€€€€€€€•±Í”è(€€€€€€€€€€€€€€€…İ…¥ĞÕÁ±½…¹±½Í” ¤(€€€€€€€¥˜±•¸¡ÍÕ‰Ñ¥Ñ±•}ÕÁ±½…‘Ì¤€ø5a}	Q!}%1Lè(€€€€€€€€€€€É…¥Í”!QQAá•ÁÑ¥½¸¡ÍÑ…ÑÕÍ}½‘”ôĞÀÀ°‘•Ñ…¥°õ˜‹–6Wš&çšr–’hí5a}	Q!}%1Môƒ’â«–¶_–æWšZ’îØˆ¤((€€€€€€€™½ÈÕÁ±½…¥¸µ•‘¥„è(€€€€€€€€€€€¥˜A…Ñ ¡ÕÁ±½…¹™¥±•¹…µ”½È€ˆˆ¤¹ÍÕ™™¥à¹±½İ•È ¤¹½Ğ¥¸5%}aQ9M%=9Lè(€€€€€€€€€€€€€€€É…¥Í”!QQAá•ÁÑ¥½¸¡ÍÑ…ÑÕÍ}½‘”ôĞÀÀ°‘•Ñ…¥°õ˜‹’â7šR¿š2–ªK’öOšZ’îÛ¾òiíÕÁ±½…¹™¥±•¹…µ•ôˆ¤(€€€€€€€ÍÕ‰Ñ¥Ñ±•}µ…Àè‘¥ÑmÍÑÈ°UÁ±½…‘¥±•t€ôíô(€€€€€€€™½ÈÕÁ±½…¥¸ÍÕ‰Ñ¥Ñ±•}ÕÁ±½…‘Ìè(€€€€€€€€€€€¥˜A…Ñ ¡ÕÁ±½…¹™¥±•¹…µ”½È€ˆˆ¤¹ÍÕ™™¥à¹±½İ•È ¤¹½Ğ¥¸MU	Q%Q1}aQ9M%=9Lè(€€€€€€€€€€€€€€€É…¥Í”!QQAá•ÁÑ¥½¸¡ÍÑ…ÑÕÍ}½‘”ôĞÀÀ°‘•Ñ…¥°õ˜‹’â7šR¿š2–¶_–æWšZ’îÛ¾òiíÕÁ±½…¹™¥±•¹…µ•ôˆ¤(€€€€€€€€€€€­•ä€ôA…Ñ ¡ÕÁ±½…¹™¥±•¹…µ”½È€ˆˆ¤¹ÍÑ•´¹…Í•™½± ¤(€€€€€€€€€€€¥˜­•ä¥¸ÍÕ‰Ñ¥Ñ±•}µ…Àè(€€€€€€€€€€€€€€€É…¥Í”!QQAá•ÁÑ¥½¸¡ÍÑ…ÑÕÍ}½‘”ôĞÀÀ°‘•Ñ…¥°õ˜‹–¶_–æWšZ’îÛ–B7¦7–’7¾òiíÕÁ±½…¹™¥±•¹…µ•ôˆ¤(€€€€€€€€€€€ÍÕ‰Ñ¥Ñ±•}µ…Ám­•åt€ôÕÁ±½…(€€€€€€€µ•‘¥…}ÍÑ•µÌ€ôíA…Ñ ¡ÕÁ±½…¹™¥±•¹…µ”½È€ˆˆ¤¹ÍÑ•´¹…Í•™½± ¤™½ÈÕÁ±½…¥¸µ•‘¥…ô(€€€€€€€Õ¹µ…Ñ¡•€ôl(€€€€€€€€€€€ÕÁ±½…¹™¥±•¹…µ”(€€€€€€€€€€€™½È­•ä°ÕÁ±½…¥¸ÍÕ‰Ñ¥Ñ±•}µ…À¹¥Ñ•µÌ ¤(€€€€€€€€€€€¥˜­•ä¹½Ğ¥¸µ•‘¥…}ÍÑ•µÌ(€€€€€€€t(€€€€€€€¥˜Õ¹µ…Ñ¡•è(€€€€€€€€€€€É…¥Í”!QQAá•ÁÑ¥½¸¡ÍÑ…ÑÕÍ}½‘”ôĞÀÀ°‘•Ñ…¥°õ˜‹–¶_–æWšÊ‡šr'–B3–B7–ªK’öO¾òiíÕ¹µ…Ñ¡•‘lÁuôˆ¤((€€€€€€€‰…Ñ¡}¥€ôÕÕ¥Ğ ¤¹¡•à(€€€€€€€ÁÉ•Á…É•è±¥ÍÑmÑÕÁ±•m‘¥ÑmÍÑÈ°¹åt°A…Ñ °A…Ñ ğ9½¹•ut€ômt(€€€€€€€ÑÉäè(€€€€€€€€€€€™½ÈÕÁ±½…¥¸µ•‘¥„è(€€€€€€€€€€€€€€€ÍÕ‰Ñ¥Ñ±”€ôÍÕ‰Ñ¥Ñ±•}µ…À¹•Ğ¡A…Ñ ¡ÕÁ±½…¹™¥±•¹…µ”½È€ˆˆ¤¹ÍÑ•´¹…Í•™½± ¤¤(€€€€€€€€€€€€€€€ÁÉ•Á…É•¹…ÁÁ•¹ (€€€€€€€€€€€€€€€€€€€…İ…¥ĞÁÉ•Á…É•}Ñ…Í¬ (€€€€€€€€€€€€€€€€€€€€€€€ÕÁ±½…°(€€€€€€€€€€€€€€€€€€€€€€€ÍÕ‰Ñ¥Ñ±”°(€€€€€€€€€€€€€€€€€€€€€€€µ½‘”°(€€€€€€€€€€€€€€€€€€€€€€€‰…Ñ¡}¥°(€€€€€€€€€€€€€€€€€€€€€€€¡…É‘}ÍÕ‰Ñ¥Ñ±•Ìõ¡…É‘}ÍÕ‰Ñ¥Ñ±•Ì°(€€€€€€€€€€€€€€€€€€€€¤(€€€€€€€€€€€€€€€€¤(€€€€€€€•á•ÁĞá•ÁÑ¥½¸è(€€€€€€€€€€€ÕÁ±½…‘}É½½Ğ€ôÉ•Í½±Ù•‘}Í•ÑÑ¥¹Ì¹Á…Ñ¡Ì¹İ½É­}‘¥È¹É•Í½±Ù” ¤€¼€‰ÕÁ±½…‘Ìˆ€¼‰…Ñ¡}¥(€€€€€€€€€€€¥˜ÕÁ±½…‘}É½½Ğ¹¥Í}‘¥È ¤è(€€€€€€€€€€€€€€€Í¡ÕÑ¥°¹ÉµÑÉ•”¡ÕÁ±½…‘}É½½Ğ¤(€€€€€€€€€€€É…¥Í”((€€€€€€€‰…Ñ €ôì(€€€€€€€€€€€€‰‰…Ñ¡}¥ˆè‰…Ñ¡}¥°(€€€€€€€€€€€€‰µ½‘”ˆèµ½‘”¹Ù…±Õ”°(€€€€€€€€€€€€‰¡…É‘}ÍÕ‰Ñ¥Ñ±•Ìˆè¡…É‘}ÍÕ‰Ñ¥Ñ±•Ì°(€€€€€€€€€€€€‰É•…Ñ•‘}…Ğˆè‘…Ñ•Ñ¥µ”¹¹½Ü ¤¹…ÍÑ¥µ•é½¹” ¤¹¥Í½™½Éµ…Ğ¡Ñ¥µ•ÍÁ•Œô‰Í•½¹‘Ìˆ¤°(€€€€€€€€€€€€‰Ñ…Í­}¥‘Ìˆèm¥Ñ•µlÁul‰Ñ…Í­}¥‰t™½È¥Ñ•´¥¸ÁÉ•Á…É•‘t°(€€€€€€€ô(€€€€€€€}İÉ¥Ñ•}‰…Ñ¡}µ…¹¥™•ÍĞ¡É•Í½±Ù•‘}Í•ÑÑ¥¹Ì°‰…Ñ ¤(€€€€€€€™½ÈÅÕ•Õ•°µ•‘¥…}Á…Ñ °ÍÕ‰Ñ¥Ñ±•}Á…Ñ ¥¸ÁÉ•Á…É•è(€€€€€€€€€€€ÍÕ‰µ¥Ñ}Ñ…Í¬¡ÅÕ•Õ•°µ•‘¥…}Á…Ñ °ÍÕ‰Ñ¥Ñ±•}Á…Ñ °µ½‘”¤(€€€€€€€É•ÑÕÉ¸ì¨©‰…Ñ °€‰Ñ…Í­Ìˆèm¥Ñ•µlÁt™½È¥Ñ•´¥¸ÁÉ•Á…É•‘uô((€€€…ÁÀ¹•Ğ ˆ½…Á¤½‰…Ñ¡•Ì½í‰…Ñ¡}¥‘ôˆ¤(€€€‘•˜•Ñ}‰…Ñ ¡‰…Ñ¡}¥èÍÑÈ¤€´ø‘¥ÑmÍÑÈ°¹åtè(€€€€€€€‰…Ñ €ô}É•…‘}‰…Ñ¡}µ…¹¥™•ÍĞ¡É•Í½±Ù•‘}Í•ÑÑ¥¹Ì°‰…Ñ¡}¥¤(€€€€€€€É•ÑÕÉ¸ì¨©‰…Ñ °€‰Ñ…Í­ÌˆèmÑ…Í­}Á…å±½…¡Ñ…Í­}¥¤™½ÈÑ…Í­}¥¥¸‰…Ñ¡l‰Ñ…Í­}¥‘Ì‰uuô((€€€…ÁÀ¹•Ğ ˆ½…Á¤½‰…Ñ¡•Ì½í‰…Ñ¡}¥‘ô½•áÁ½ÉĞ¹é¥Àˆ¤(€€€‘•˜•áÁ½ÉÑ}‰…Ñ  (€€€€€€€‰…Ñ¡}¥èÍÑÈ°(€€€€€€€ÑåÁ•Ìè¹¹½Ñ…Ñ•‘m±¥ÍÑmáÁ½ÉÑQåÁ•tğ9½¹”°EÕ•Éä ¥t€ô9½¹”°(€€€€€€€­¥¹è1•…åáÁ½ÉÑ-¥¹ğ9½¹”€ô9½¹”°(€€€€¤€´ø¥±•I•ÍÁ½¹Í”è(€€€€€€€‰…Ñ €ô}É•…‘}‰…Ñ¡}µ…¹¥™•ÍĞ¡É•Í½±Ù•‘}Í•ÑÑ¥¹Ì°‰…Ñ¡}¥¤(€€€€€€€Ñ…Í­Ì€ômÑ…Í­}Á…å±½…¡Ñ…Í­}¥¤™½ÈÑ…Í­}¥¥¸‰…Ñ¡l‰Ñ…Í­}¥‘Ì‰ut(€€€€€€€¥˜…¹ä¡Ñ…Í­l‰ÍÑ…ÑÕÌ‰t¹½Ğ¥¸ì‰½µÁ±•Ñ•ˆ°€‰™…¥±•ˆ°€‰…¹•±±•‰ô™½ÈÑ…Í¬¥¸Ñ…Í­Ì¤è(€€€€€€€€€€€É…¥Í”!QQAá•ÁÑ¥½¸¡ÍÑ…ÑÕÍ}½‘”ôĞÀä°‘•Ñ…¥°ô‹š&çš²‡’î7–r£–’B’â´ˆ¤(€€€€€€€½µÁ±•Ñ•€ômÑ…Í¬™½ÈÑ…Í¬¥¸Ñ…Í­Ì¥˜Ñ…Í­l‰ÍÑ…ÑÕÌ‰t€ôô€‰½µÁ±•Ñ•‰t(€€€€€€€¥˜¹½Ğ½µÁ±•Ñ•è(€€€€€€€€€€€É…¥Í”!QQAá•ÁÑ¥½¸¡ÍÑ…ÑÕÍ}½‘”ôĞÀä°‘•Ñ…¥°ô‹š&çš²‡’â·šÊ‡šr'–>¿–¾ó–ëj–º3š"C’îï–*„ˆ¤((€€€€€€€•áÁ½ÉÑ}‘¥È€ôÉ•Í½±Ù•‘}Í•ÑÑ¥¹Ì¹Á…Ñ¡Ì¹İ½É­}‘¥È¹É•Í½±Ù” ¤€¼€‰•áÁ½ÉÑÌˆ(€€€€€€€•áÁ½ÉÑ}‘¥È¹µ­‘¥È¡Á…É•¹ÑÌõQÉÕ”°•á¥ÍÑ}½¬õQÉÕ”¤(€€€€€€€…É¡¥Ù•}Á…Ñ €ô•áÁ½ÉÑ}‘¥È€¼˜‰í‰…Ñ¡}¥‘ôµíÕÕ¥Ğ ¤¹¡•áô¹é¥Àˆ(€€€€€€€Í•±•Ñ•€ô}Í•±•Ñ•‘}•áÁ½ÉÑ}™¥±•Ì¡ÑåÁ•Ì°­¥¹¤(€€€€€€€İ¥Ñ é¥Á™¥±”¹i¥Á¥±”¡…É¡¥Ù•}Á…Ñ °€‰Üˆ°½µÁÉ•ÍÍ¥½¸õé¥Á™¥±”¹i%A}1Q¤…Ì…É¡¥Ù”è(€€€€€€€€€€€ÕÍ•‘}™½±‘•ÉÌèÍ•ÑmÍÑÉt€ôÍ•Ğ ¤(€€€€€€€€€€€™½ÈÑ…Í¬¥¸½µÁ±•Ñ•è(€€€€€€€€€€€€€€€½ÕÑÁÕÑ}‘¥È€ôÉ•Í½±Ù•‘}Í•ÑÑ¥¹Ì¹Á…Ñ¡Ì¹½ÕÑÁÕÑ}‘¥È¹É•Í½±Ù” ¤€¼Ñ…Í­l‰Ñ…Í­}¥‰t(€€€€€€€€€€€€€€€ÍÑ•´€ô}µ•‘¥…}ÍÑ•´¡Ñ…Í¬¤(€€€€€€€€€€€€€€€™½±‘•È€ôÍÑ•´(€€€€€€€€€€€€€€€¥˜™½±‘•È¹…Í•™½± ¤¥¸ÕÍ•‘}™½±‘•ÉÌè(€€€€€€€€€€€€€€€€€€€™½±‘•È€ô˜‰íÍÑ•µôµíÑ…Í­lÑ…Í­}¥ulèáuôˆ(€€€€€€€€€€€€€€€ÕÍ•‘}™½±‘•ÉÌ¹…‘¡™½±‘•È¹…Í•™½± ¤¤(€€€€€€€€€€€€€€€™½È¥¹Ñ•É¹…±}¹…µ”¥¸Í•±•Ñ•è(€€€€€€€€€€€€€€€€€€€Í½ÕÉ”€ô½ÕÑÁÕÑ}‘¥È€¼¥¹Ñ•É¹…±}¹…µ”(€€€€€€€€€€€€€€€€€€€¥˜Í½ÕÉ”¹¥Í}™¥±” ¤è(€€€€€€€€€€€€€€€€€€€€€€€…É¡¥Ù”¹İÉ¥Ñ” (€€€€€€€€€€€€€€€€€€€€€€€€€€€Í½ÕÉ”°(€€€€€€€€€€€€€€€€€€€€€€€€€€€˜‰í™½±‘•Éô½í}•áÁ½ÉÑ}™¥±•¹…µ”¡Ñ…Í¬°¥¹Ñ•É¹…±}¹…µ”¥ôˆ°(€€€€€€€€€€€€€€€€€€€€€€€€¤(€€€€€€€É•ÑÕÉ¸¥±•I•ÍÁ½¹Í” (€€€€€€€€€€€…É¡¥Ù•}Á…Ñ °(€€€€€€€€€€€µ•‘¥…}ÑåÁ”ô‰…ÁÁ±¥…Ñ¥½¸½é¥Àˆ°(€€€€€€€€€€€™¥±•¹…µ”õ˜‰Ù¥‘•¼ÉÑáĞµí‰…Ñ¡}¥‘lèáuô¹é¥Àˆ°(€€€€€€€€€€€‰…­É½Õ¹õ	…­É½Õ¹‘Q…Í¬¡…É¡¥Ù•}Á…Ñ ¹Õ¹±¥¹¬°µ¥ÍÍ¥¹}½¬õQÉÕ”¤°(€€€€€€€€¤((€€€…ÁÀ¹µ½Õ¹Ğ ˆ¼ˆ°MÑ…Ñ¥¥±•Ì¡‘¥É•Ñ½ÉäõÍÑ…Ñ¥}‘¥È°¡Ñµ°õQÉÕ”¤°¹…µ”ô‰ÍÑ…Ñ¥Œˆ¤((€€€É•ÑÕÉ¸…ÁÀ(()…ÁÀ€ôÉ•…Ñ•}…ÁÀ ¤(
+                        "warnings",
+                        "error",
+                    )
+                }
+                queued["status"] = "queued"
+                queued["asr_mode"] = job.get("asr_mode") or ASRMode.LOCAL.value
+                queued["api_hotwords"] = job.get("api_hotwords") or []
+                submit_task(
+                    queued,
+                    media_path,
+                    subtitle_path,
+                    FusionMode(str(job["mode"])),
+                )
+            except Exception:
+                job_path.rename(job_path.with_suffix(".invalid"))
+
+    def storage_payload() -> dict[str, Any]:
+        work_root = resolved_settings.paths.work_dir.resolve()
+        output_root = resolved_settings.paths.output_dir.resolve()
+        return {
+            "work_bytes": _directory_size(work_root),
+            "output_bytes": _directory_size(output_root),
+            "uploads_bytes": _directory_size(work_root / "uploads"),
+            "cache_bytes": _directory_size(work_root / "cache"),
+            "task_count": sum(1 for _ in output_root.glob("*/task.json"))
+            if output_root.is_dir()
+            else 0,
+            "pending_count": sum(1 for _ in (work_root / "queue").glob("*.json"))
+            if (work_root / "queue").is_dir()
+            else 0,
+        }
+
+    async def prepare_task(
+        media: UploadFile,
+        subtitle: UploadFile | None,
+        mode: FusionMode,
+        batch_id: str | None = None,
+        hard_subtitles: bool = False,
+        translate_to_chinese: bool = False,
+        asr_mode: ASRMode = ASRMode.LOCAL,
+        api_hotwords: list[str] | None = None,
+    ) -> tuple[dict[str, Any], Path, Path | None]:
+        media_suffix = Path(media.filename or "").suffix.lower()
+        if media_suffix not in MEDIA_EXTENSIONS:
+            raise HTTPException(status_code=400, detail="ä¸æ”¯æŒè¯¥è§†é¢‘æˆ–éŸ³é¢‘æ ¼å¼")
+        subtitle_suffix: str | None = None
+        if subtitle is not None and subtitle.filename:
+            subtitle_suffix = Path(subtitle.filename).suffix.lower()
+            if subtitle_suffix not in SUBTITLE_EXTENSIONS:
+                raise HTTPException(status_code=400, detail="ä¸æ”¯æŒè¯¥å­—å¹•æ ¼å¼")
+
+        task_id = uuid4().hex
+        upload_group = batch_id or task_id
+        upload_dir = resolved_settings.paths.work_dir.resolve() / "uploads" / upload_group / task_id
+        media_path = upload_dir / f"source{media_suffix}"
+        media_size = await _save_upload(media, media_path)
+        subtitle_path: Path | None = None
+        if subtitle is not None and subtitle_suffix:
+            subtitle_path = upload_dir / f"subtitle{subtitle_suffix}"
+            await _save_upload(subtitle, subtitle_path)
+
+        queued = {
+            "task_id": task_id,
+            "batch_id": batch_id,
+            "status": "queued",
+            "mode": mode.value,
+            "hard_subtitles": hard_subtitles,
+            "translate_to_chinese": translate_to_chinese,
+            "asr_mode": asr_mode.value,
+            "api_language": None,
+            "api_hotwords": api_hotwords or [] if asr_mode == ASRMode.API else [],
+            "original_filename": media.filename,
+            "media_size": media_size,
+            "warnings": [],
+            "error": None,
+        }
+        return queued, media_path, subtitle_path
+
+    @app.get("/api/health")
+    def health() -> dict[str, Any]:
+        model_path = resolved_settings.asr.model_path
+        return {
+            "ok": True,
+            "version": __version__,
+            "model_configured": bool(model_path and model_path.is_dir()),
+            "model_name": _model_display_name(model_path),
+            "device": resolved_settings.asr.device,
+            "compute_type": resolved_settings.asr.compute_type,
+            "ocr_available": bool(
+                importlib.util.find_spec("paddleocr") and importlib.util.find_spec("paddle")
+            ),
+            "translation_models_available": _translation_models_available(resolved_settings),
+            "api_pipeline_available": _api_pipeline_available(resolved_settings),
+            "api_key_environment": resolved_settings.qwen_asr.api_key_environment,
+        }
+
+    @app.get("/api/storage")
+    def get_storage() -> dict[str, Any]:
+        return storage_payload()
+
+    @app.post("/api/storage/cleanup")
+    def cleanup_storage(scope: Annotated[str, Form()]) -> dict[str, Any]:
+        if scope not in {"temporary", "cache"}:
+            raise HTTPException(status_code=400, detail="ä¸æ”¯æŒè¯¥æ¸…ç†èŒƒå›´")
+        work_root = resolved_settings.paths.work_dir.resolve()
+        if scope == "cache" and storage_payload()["pending_count"]:
+            raise HTTPException(status_code=409, detail="æœ‰ä»»åŠ¡æ­£åœ¨è¿è¡Œï¼Œæš‚ä¸èƒ½æ¸…ç†ç¼“å­˜")
+        freed_bytes = 0
+        if scope == "cache":
+            freed_bytes += _remove_child_path(work_root, work_root / "cache")
+        elif work_root.is_dir():
+            for task_dir in work_root.iterdir():
+                manifest_path = task_dir / "task.json"
+                if not task_dir.is_dir() or not manifest_path.is_file():
+                    continue
+                try:
+                    manifest = TaskManifest.model_validate_json(
+                        manifest_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, ValueError):
+                    continue
+                if manifest.status not in TERMINAL_STATUSES:
+                    continue
+                for target in (task_dir / "audio.wav", task_dir / "ocr-frames"):
+                    freed_bytes += _remove_child_path(work_root, target)
+        return {"scope": scope, "freed_bytes": freed_bytes, **storage_payload()}
+
+    @app.get("/api/tasks")
+    def list_tasks(
+        page: Annotated[int, Query(ge=1)] = 1,
+        page_size: Annotated[int, Query(ge=1, le=100)] = 12,
+    ) -> dict[str, Any]:
+        tasks: list[dict[str, Any]] = []
+        output_root = resolved_settings.paths.output_dir.resolve()
+        if output_root.is_dir():
+            manifests = sorted(
+                output_root.glob("*/task.json"),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            total = len(manifests)
+            start = (page - 1) * page_size
+            for manifest_path in manifests[start : start + page_size]:
+                try:
+                    manifest = TaskManifest.model_validate_json(
+                        manifest_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, ValueError):
+                    continue
+                tasks.append(_manifest_payload(manifest))
+        else:
+            total = 0
+        return {
+            "tasks": tasks,
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": max(1, (total + page_size - 1) // page_size),
+        }
+
+    @app.delete("/api/tasks")
+    def delete_all_tasks() -> dict[str, Any]:
+        work_root = resolved_settings.paths.work_dir.resolve()
+        output_root = resolved_settings.paths.output_dir.resolve()
+        if storage_payload()["pending_count"]:
+            raise HTTPException(status_code=409, detail="æœ‰ä»»åŠ¡æ­£åœ¨è¿è¡Œï¼Œæš‚ä¸èƒ½æ¸…ç©ºå…¨éƒ¨ä»»åŠ¡")
+
+        manifests: dict[str, TaskManifest] = {}
+        for root in (output_root, work_root):
+            if not root.is_dir():
+                continue
+            for manifest_path in root.glob("*/task.json"):
+                try:
+                    manifest = TaskManifest.model_validate_json(
+                        manifest_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, ValueError):
+                    continue
+                manifests[manifest.task_id] = manifest
+        if any(manifest.status not in TERMINAL_STATUSES for manifest in manifests.values()):
+            raise HTTPException(status_code=409, detail="æœ‰ä»»åŠ¡æ­£åœ¨è¿è¡Œï¼Œæš‚ä¸èƒ½æ¸…ç©ºå…¨éƒ¨ä»»åŠ¡")
+
+        freed_bytes = 0
+        for child in list(output_root.iterdir()) if output_root.is_dir() else []:
+            freed_bytes += _remove_child_path(output_root, child)
+        for manifest in manifests.values():
+            freed_bytes += _remove_child_path(work_root, work_root / manifest.task_id)
+            registry.remove(manifest.task_id)
+        for managed_name in ("uploads", "batches"):
+            managed_root = work_root / managed_name
+            if not managed_root.is_dir():
+                continue
+            for child in list(managed_root.iterdir()):
+                freed_bytes += _remove_child_path(managed_root, child)
+
+        return {
+            "cleared_tasks": len(manifests),
+            "freed_bytes": freed_bytes,
+            **storage_payload(),
+        }
+
+    @app.get("/api/tasks/{task_id}")
+    def get_task(task_id: str) -> dict[str, Any]:
+        return task_payload(task_id)
+
+    @app.post("/api/tasks/{task_id}/retry", status_code=202)
+    def retry_task(task_id: str) -> dict[str, Any]:
+        manifest = load_task_manifest(task_id)
+        if manifest is None:
+            raise HTTPException(status_code=404, detail="ä»»åŠ¡ä¸å­˜åœ¨")
+        if manifest.status != TaskStatus.FAILED:
+            raise HTTPException(status_code=409, detail="åªæœ‰å¤±è´¥ä»»åŠ¡å¯ä»¥é‡è¯•")
+        if not manifest.input_path.is_file():
+            raise HTTPException(status_code=409, detail="åŸå§‹ä¸Šä¼ æ–‡ä»¶å·²è¢«æ¸…ç†ï¼Œæ— æ³•é‡è¯•")
+
+        batch_id = uuid4().hex
+        new_task_id = uuid4().hex
+        upload_dir = resolved_settings.paths.work_dir.resolve() / "uploads" / batch_id / new_task_id
+        media_path = upload_dir / f"source{manifest.input_path.suffix.lower()}"
+        subtitle_value = manifest.artifacts.get("subtitle_source")
+        subtitle_source = Path(subtitle_value) if subtitle_value else None
+        subtitle_path: Path | None = None
+        try:
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(manifest.input_path, media_path)
+            if subtitle_source is not None and subtitle_source.is_file():
+                subtitle_path = upload_dir / f"subtitle{subtitle_source.suffix.lower()}"
+                shutil.copy2(subtitle_source, subtitle_path)
+        except Exception:
+            _remove_child_path(
+                resolved_settings.paths.work_dir.resolve(),
+                resolved_settings.paths.work_dir.resolve() / "uploads" / batch_id,
+            )
+            raise
+
+        queued = {
+            "task_id": new_task_id,
+            "batch_id": batch_id,
+            "status": "queued",
+            "mode": manifest.mode.value,
+            "hard_subtitles": manifest.hard_subtitles,
+            "translate_to_chinese": manifest.translate_to_chinese,
+            "asr_mode": manifest.asr_mode.value,
+            "api_language": manifest.api_language,
+            "api_hotwords": manifest.api_hotwords,
+            "original_filename": manifest.original_filename or manifest.input_path.name,
+            "media_size": media_path.stat().st_size,
+            "warnings": [],
+            "error": None,
+        }
+        batch = {
+            "batch_id": batch_id,
+            "mode": manifest.mode.value,
+            "hard_subtitles": manifest.hard_subtitles,
+            "translate_to_chinese": manifest.translate_to_chinese,
+            "asr_mode": manifest.asr_mode.value,
+            "api_language": manifest.api_language,
+            "api_hotwords": manifest.api_hotwords,
+            "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "task_ids": [new_task_id],
+        }
+        _write_batch_manifest(resolved_settings, batch)
+        submit_task(queued, media_path, subtitle_path, manifest.mode)
+        return {**batch, "tasks": [queued]}
+
+    @app.delete("/api/tasks/{task_id}")
+    def delete_task(task_id: str) -> dict[str, Any]:
+        payload = task_payload(task_id)
+        try:
+            status = TaskStatus(payload["status"])
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail="ä»»åŠ¡çŠ¶æ€æ— æ•ˆ") from error
+        if status not in TERMINAL_STATUSES:
+            raise HTTPException(status_code=409, detail="è¿è¡Œä¸­çš„ä»»åŠ¡ä¸èƒ½åˆ é™¤")
+
+        safe_task_id = _validate_id(task_id, "ä»»åŠ¡")
+        work_root = resolved_settings.paths.work_dir.resolve()
+        output_root = resolved_settings.paths.output_dir.resolve()
+        batch_id = payload.get("batch_id")
+        freed_bytes = 0
+        for target, root in (
+            (work_root / safe_task_id, work_root),
+            (output_root / safe_task_id, output_root),
+        ):
+            freed_bytes += _remove_child_path(root, target)
+        upload_group = str(batch_id or safe_task_id)
+        freed_bytes += _remove_child_path(
+            work_root,
+            work_root / "uploads" / upload_group / safe_task_id,
+        )
+        _task_job_path(resolved_settings, safe_task_id).unlink(missing_ok=True)
+        registry.remove(safe_task_id)
+
+        if batch_id:
+            batch_path = _batch_manifest_path(
+                resolved_settings, _validate_id(str(batch_id), "æ‰¹æ¬¡")
+            )
+            if batch_path.is_file():
+                batch = json.loads(batch_path.read_text(encoding="utf-8"))
+                batch["task_ids"] = [
+                    item for item in batch.get("task_ids", []) if item != safe_task_id
+                ]
+                if batch["task_ids"]:
+                    _write_batch_manifest(resolved_settings, batch)
+                else:
+                    batch_path.unlink(missing_ok=True)
+        return {"task_id": safe_task_id, "freed_bytes": freed_bytes, **storage_payload()}
+
+    @app.get("/api/tasks/{task_id}/files/{filename}")
+    def download_task_file(task_id: str, filename: str) -> FileResponse:
+        if filename not in DOWNLOAD_FILES:
+            raise HTTPException(status_code=404, detail="æ–‡ä»¶ä¸å­˜åœ¨")
+        safe_task_id = _validate_id(task_id, "ä»»åŠ¡")
+        target = resolved_settings.paths.output_dir.resolve() / safe_task_id / filename
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail="æ–‡ä»¶ä¸å­˜åœ¨")
+        task = task_payload(safe_task_id)
+        return FileResponse(target, filename=_export_filename(task, filename))
+
+    @app.get("/api/tasks/{task_id}/export")
+    def export_task(
+        task_id: str,
+        types: Annotated[list[ExportType] | None, Query()] = None,
+        kind: LegacyExportKind | None = None,
+    ) -> FileResponse:
+        task = task_payload(task_id)
+        if task["status"] != "completed":
+            raise HTTPException(status_code=409, detail="ä»»åŠ¡å°šæœªå®Œæˆ")
+        output_dir = resolved_settings.paths.output_dir.resolve() / task["task_id"]
+        selected = _selected_export_files(types, kind)
+        available = [name for name in selected if (output_dir / name).is_file()]
+        if len(available) != len(selected):
+            raise HTTPException(status_code=404, detail="æ‰€é€‰ç±»å‹çš„æ–‡ä»¶ä¸å­˜åœ¨")
+        if not available:
+            raise HTTPException(status_code=404, detail="æ²¡æœ‰å¯ä¸‹è½½çš„æ–‡ä»¶")
+        if len(selected) == 1:
+            internal_name = available[0]
+            return FileResponse(
+                output_dir / internal_name,
+                filename=_export_filename(task, internal_name),
+            )
+
+        export_dir = resolved_settings.paths.work_dir.resolve() / "exports"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        archive_path = export_dir / f"{task['task_id']}-{uuid4().hex}.zip"
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for internal_name in available:
+                archive.write(
+                    output_dir / internal_name,
+                    _export_filename(task, internal_name),
+                )
+        return FileResponse(
+            archive_path,
+            media_type="application/zip",
+            filename=f"{_media_stem(task)}.zip",
+            background=BackgroundTask(archive_path.unlink, missing_ok=True),
+        )
+
+    @app.post("/api/tasks", status_code=202)
+    async def create_task(
+        media: Annotated[UploadFile, File()],
+        subtitle: Annotated[UploadFile | None, File()] = None,
+        mode: Annotated[FusionMode, Form()] = FusionMode.VERBATIM,
+        hard_subtitles: Annotated[bool, Form()] = False,
+        translate_to_chinese: Annotated[bool, Form()] = False,
+        asr_mode: Annotated[ASRMode, Form()] = ASRMode.LOCAL,
+        api_hotwords: Annotated[str, Form()] = "",
+    ) -> dict[str, Any]:
+        model_path = resolved_settings.asr.model_path
+        if asr_mode == ASRMode.LOCAL and (model_path is None or not model_path.is_dir()):
+            raise HTTPException(status_code=503, detail="æœ¬åœ° ASR æ¨¡å‹å°šæœªé…ç½®")
+        if (
+            asr_mode == ASRMode.LOCAL
+            and translate_to_chinese
+            and not _translation_models_available(resolved_settings)
+        ):
+            raise HTTPException(status_code=503, detail="ç¦»çº¿ä¸­æ–‡ç¿»è¯‘æ¨¡å‹å°šæœªå®‰è£…")
+        if asr_mode == ASRMode.API and not _api_pipeline_available(resolved_settings):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "API æ¨¡å¼ä¸å¯ç”¨ï¼šè¯·è®¾ç½® "
+                    f"{resolved_settings.qwen_asr.api_key_environment}ã€å®‰è£… requests å¹¶"
+                    "ç™»å½• Codex CLI"
+                ),
+            )
+        hotwords = _parse_api_hotwords(api_hotwords)
+        effective_translation = translate_to_chinese or asr_mode == ASRMode.API
+
+        queued, media_path, subtitle_path = await prepare_task(
+            media,
+            subtitle,
+            mode,
+            hard_subtitles=hard_subtitles,
+            translate_to_chinese=effective_translation,
+            asr_mode=asr_mode,
+            api_hotwords=hotwords,
+        )
+        submit_task(queued, media_path, subtitle_path, mode)
+        return queued
+
+    @app.post("/api/batches", status_code=202)
+    async def create_batch(
+        media: Annotated[list[UploadFile], File()],
+        subtitles: Annotated[list[UploadFile | str] | None, File()] = None,
+        mode: Annotated[FusionMode, Form()] = FusionMode.VERBATIM,
+        hard_subtitles: Annotated[bool, Form()] = False,
+        translate_to_chinese: Annotated[bool, Form()] = False,
+        asr_mode: Annotated[ASRMode, Form()] = ASRMode.LOCAL,
+        api_hotwords: Annotated[str, Form()] = "",
+    ) -> dict[str, Any]:
+        model_path = resolved_settings.asr.model_path
+        if asr_mode == ASRMode.LOCAL and (model_path is None or not model_path.is_dir()):
+            raise HTTPException(status_code=503, detail="æœ¬åœ° ASR æ¨¡å‹å°šæœªé…ç½®")
+        if (
+            asr_mode == ASRMode.LOCAL
+            and translate_to_chinese
+            and not _translation_models_available(resolved_settings)
+        ):
+            raise HTTPException(status_code=503, detail="ç¦»çº¿ä¸­æ–‡ç¿»è¯‘æ¨¡å‹å°šæœªå®‰è£…")
+        if asr_mode == ASRMode.API and not _api_pipeline_available(resolved_settings):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "API æ¨¡å¼ä¸å¯ç”¨ï¼šè¯·è®¾ç½® "
+                    f"{resolved_settings.qwen_asr.api_key_environment}ã€å®‰è£… requests å¹¶"
+                    "ç™»å½• Codex CLI"
+                ),
+            )
+        hotwords = _parse_api_hotwords(api_hotwords)
+        effective_translation = translate_to_chinese or asr_mode == ASRMode.API
+        if not media:
+            raise HTTPException(status_code=400, detail="è¯·è‡³å°‘ä¸Šä¼ ä¸€ä¸ªåª’ä½“æ–‡ä»¶")
+        if len(media) > MAX_BATCH_FILES:
+            raise HTTPException(status_code=400, detail=f"å•æ‰¹æœ€å¤š {MAX_BATCH_FILES} ä¸ªåª’ä½“æ–‡ä»¶")
+        subtitle_uploads: list[UploadFile] = []
+        for upload in subtitles or []:
+            if isinstance(upload, str):
+                continue
+            if upload.filename:
+                subtitle_uploads.append(upload)
+            else:
+                await upload.close()
+        if len(subtitle_uploads) > MAX_BATCH_FILES:
+            raise HTTPException(status_code=400, detail=f"å•æ‰¹æœ€å¤š {MAX_BATCH_FILES} ä¸ªå­—å¹•æ–‡ä»¶")
+
+        for upload in media:
+            if Path(upload.filename or "").suffix.lower() not in MEDIA_EXTENSIONS:
+                raise HTTPException(status_code=400, detail=f"ä¸æ”¯æŒåª’ä½“æ–‡ä»¶ï¼š{upload.filename}")
+        subtitle_map: dict[str, UploadFile] = {}
+        for upload in subtitle_uploads:
+            if Path(upload.filename or "").suffix.lower() not in SUBTITLE_EXTENSIONS:
+                raise HTTPException(status_code=400, detail=f"ä¸æ”¯æŒå­—å¹•æ–‡ä»¶ï¼š{upload.filename}")
+            key = Path(upload.filename or "").stem.casefold()
+            if key in subtitle_map:
+                raise HTTPException(status_code=400, detail=f"å­—å¹•æ–‡ä»¶åé‡å¤ï¼š{upload.filename}")
+            subtitle_map[key] = upload
+        media_stems = {Path(upload.filename or "").stem.casefold() for upload in media}
+        unmatched = [
+            upload.filename for key, upload in subtitle_map.items() if key not in media_stems
+        ]
+        if unmatched:
+            raise HTTPException(status_code=400, detail=f"å­—å¹•æ²¡æœ‰åŒååª’ä½“ï¼š{unmatched[0]}")
+
+        batch_id = uuid4().hex
+        prepared: list[tuple[dict[str, Any], Path, Path | None]] = []
+        try:
+            for upload in media:
+                subtitle = subtitle_map.get(Path(upload.filename or "").stem.casefold())
+                prepared.append(
+                    await prepare_task(
+                        upload,
+                        subtitle,
+                        mode,
+                        batch_id,
+                        hard_subtitles=hard_subtitles,
+                        translate_to_chinese=effective_translation,
+                        asr_mode=asr_mode,
+                        api_hotwords=hotwords,
+                    )
+                )
+        except Exception:
+            upload_root = resolved_settings.paths.work_dir.resolve() / "uploads" / batch_id
+            if upload_root.is_dir():
+                shutil.rmtree(upload_root)
+            raise
+
+        batch = {
+            "batch_id": batch_id,
+            "mode": mode.value,
+            "hard_subtitles": hard_subtitles,
+            "translate_to_chinese": effective_translation,
+            "asr_mode": asr_mode.value,
+            "api_language": None,
+            "api_hotwords": hotwords if asr_mode == ASRMode.API else [],
+            "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "task_ids": [item[0]["task_id"] for item in prepared],
+        }
+        _write_batch_manifest(resolved_settings, batch)
+        for queued, media_path, subtitle_path in prepared:
+            submit_task(queued, media_path, subtitle_path, mode)
+        return {**batch, "tasks": [item[0] for item in prepared]}
+
+    @app.get("/api/batches/{batch_id}")
+    def get_batch(batch_id: str) -> dict[str, Any]:
+        batch = _read_batch_manifest(resolved_settings, batch_id)
+        return {**batch, "tasks": [task_payload(task_id) for task_id in batch["task_ids"]]}
+
+    @app.get("/api/batches/{batch_id}/export.zip")
+    def export_batch(
+        batch_id: str,
+        types: Annotated[list[ExportType] | None, Query()] = None,
+        kind: LegacyExportKind | None = None,
+    ) -> FileResponse:
+        batch = _read_batch_manifest(resolved_settings, batch_id)
+        tasks = [task_payload(task_id) for task_id in batch["task_ids"]]
+        if any(task["status"] not in {"completed", "failed", "cancelled"} for task in tasks):
+            raise HTTPException(status_code=409, detail="æ‰¹æ¬¡ä»åœ¨å¤„ç†ä¸­")
+        completed = [task for task in tasks if task["status"] == "completed"]
+        if not completed:
+            raise HTTPException(status_code=409, detail="æ‰¹æ¬¡ä¸­æ²¡æœ‰å¯å¯¼å‡ºçš„å®Œæˆä»»åŠ¡")
+
+        export_dir = resolved_settings.paths.work_dir.resolve() / "exports"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        archive_path = export_dir / f"{batch_id}-{uuid4().hex}.zip"
+        selected = _selected_export_files(types, kind)
+        exported_count = 0
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            used_folders: set[str] = set()
+            for task in completed:
+                output_dir = resolved_settings.paths.output_dir.resolve() / task["task_id"]
+                stem = _media_stem(task)
+                folder = stem
+                if folder.casefold() in used_folders:
+                    folder = f"{stem}-{task['task_id'][:8]}"
+                used_folders.add(folder.casefold())
+                for internal_name in selected:
+                    source = output_dir / internal_name
+                    if source.is_file():
+                        archive.write(
+                            source,
+                            f"{folder}/{_export_filename(task, internal_name)}",
+                        )
+                        exported_count += 1
+        if exported_count == 0:
+            archive_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=404, detail="æ‰€é€‰ç±»å‹çš„æ–‡ä»¶ä¸å­˜åœ¨")
+        return FileResponse(
+            archive_path,
+            media_type="application/zip",
+            filename=f"video2txt-{batch_id[:8]}.zip",
+            background=BackgroundTask(archive_path.unlink, missing_ok=True),
+        )
+
+    app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
+
+    return app
+
+
+app = create_app()

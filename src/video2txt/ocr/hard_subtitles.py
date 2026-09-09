@@ -44,8 +44,7 @@ def _image_signature(path: Path, settings: OCRSettings) -> bytes:
         focused = ImageOps.autocontrast(gray.crop(box)).resize((192, 32))
         edges = focused.filter(ImageFilter.FIND_EDGES)
         return bytes(
-            255 if value >= settings.signature_edge_threshold else 0
-            for value in edges.tobytes()
+            255 if value >= settings.signature_edge_threshold else 0 for value in edges.tobytes()
         )
 
 
@@ -156,9 +155,7 @@ def extract_hard_subtitles(
             cue_end = min(cue_end, duration)
         signature = _image_signature(frame, settings)
         difference = (
-            1.0
-            if previous_signature is None
-            else _image_difference(previous_signature, signature)
+            1.0 if previous_signature is None else _image_difference(previous_signature, signature)
         )
         previous_signature = signature
 

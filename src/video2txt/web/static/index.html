@@ -9,7 +9,7 @@
       name="description"
       content="本地优先的视频音频转写与字幕融合工作台"
     />
-    <link rel="stylesheet" href="/styles.css?v=20260723-batch-reset" />
+    <link rel="stylesheet" href="/styles.css?v=20260909-auto-language" />
   </head>
   <body>
     <div class="noise" aria-hidden="true"></div>
@@ -77,12 +77,46 @@
             </label>
           </div>
 
+          <fieldset id="asr-engine-fieldset">
+            <legend>识别引擎</legend>
+            <div class="mode-grid">
+              <label class="mode-option">
+                <input type="radio" name="asr_mode" value="local" checked />
+                <span><b>本地模型</b><small>沿用 faster-whisper 与本机 NLLB 翻译</small></span>
+              </label>
+              <label class="mode-option">
+                <input type="radio" name="asr_mode" value="api" />
+                <span><b>千问 API</b><small>自动识别本地语种与英文，Codex CLI 翻译中文</small></span>
+              </label>
+            </div>
+            <div id="api-asr-options" hidden>
+              <div class="api-asr-fields">
+                <label class="api-asr-field" for="api-hotwords-input">
+                  <span>热词</span>
+                  <textarea id="api-hotwords-input" name="api_hotwords" rows="3">RedotPay
+PayPal
+Apply Now</textarea>
+                </label>
+              </div>
+              <p class="field-hint" id="api-asr-hint">热词会自动记住；音频会上传到千问，原文与译文保存到本机。</p>
+            </div>
+          </fieldset>
+
           <label class="feature-toggle" id="ocr-toggle">
             <input id="hard-subtitles-input" name="hard_subtitles" type="checkbox" value="true" />
             <span class="toggle-track" aria-hidden="true"><i></i></span>
             <span class="toggle-copy">
               <b>识别画面硬字幕</b>
               <small id="ocr-hint">使用本地轻量 OCR，任务中会显示逐帧处理进度</small>
+            </span>
+          </label>
+
+          <label class="feature-toggle" id="translation-toggle">
+            <input id="translate-to-chinese-input" name="translate_to_chinese" type="checkbox" value="true" />
+            <span class="toggle-track" aria-hidden="true"><i></i></span>
+            <span class="toggle-copy">
+              <b>额外生成中文字幕</b>
+              <small id="translation-hint">开始提取前勾选才会生成中文文件；本地模式使用离线 NLLB 翻译；右侧下载类型只决定导出范围。</small>
             </span>
           </label>
 
@@ -145,6 +179,8 @@
                 <span>下载类型</span>
                 <label class="export-option"><input type="checkbox" data-batch-export-type value="text" checked /><i></i>文本文件</label>
                 <label class="export-option"><input type="checkbox" data-batch-export-type value="subtitle" /><i></i>字幕文件</label>
+                <label class="export-option"><input type="checkbox" data-batch-export-type value="translation" /><i></i>中文字幕文件</label>
+                <label class="export-option"><input type="checkbox" data-batch-export-type value="translation_text" /><i></i>中文文本文件</label>
                 <a id="batch-export" class="batch-export" aria-disabled="true">批量下载</a>
               </div>
             </div>
@@ -165,6 +201,8 @@
               <span>下载类型</span>
               <label class="export-option"><input type="checkbox" data-task-export-type value="text" checked /><i></i>文本文件</label>
               <label class="export-option"><input type="checkbox" data-task-export-type value="subtitle" /><i></i>字幕文件</label>
+              <label class="export-option"><input type="checkbox" data-task-export-type value="translation" /><i></i>中文字幕文件</label>
+              <label class="export-option"><input type="checkbox" data-task-export-type value="translation_text" /><i></i>中文文本文件</label>
               <a id="task-export" class="primary-download">下载</a>
             </div>
             <p class="warning-text" id="warning-text"></p>
@@ -193,6 +231,11 @@
         <div class="history-list" id="history-list">
           <p class="history-empty">暂无历史任务</p>
         </div>
+        <nav class="history-pagination" id="history-pagination" aria-label="任务历史分页" hidden>
+          <button type="button" id="history-previous">← 上一页</button>
+          <span id="history-page-info"></span>
+          <button type="button" id="history-next">下一页 →</button>
+        </nav>
       </section>
 
       <section class="storage-section">
@@ -215,7 +258,7 @@
       </section>
     </main>
 
-    <footer><span>Video2Txt v<span id="app-version">1.0.0</span></span><span>本地处理 · 可追溯融合</span></footer>
-    <script src="/app.js?v=20260723-batch-reset" defer></script>
+    <footer><span>Video2Txt v<span id="app-version">2.0.0</span></span><span>本地处理 · 可追溯融合</span></footer>
+    <script src="/app.js?v=20260909-hotword-storage" defer></script>
   </body>
 </html>

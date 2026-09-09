@@ -15,9 +15,10 @@ from video2txt.export.results import export_json, export_srt, export_text
 from video2txt.media.audio import normalize_audio
 from video2txt.media.probe import probe_media
 from video2txt.media.subtitles import extract_text_subtitle
-from video2txt.models import FusionMode, SourceType, SubtitleCue, Transcript
+from video2txt.models import ASRMode, FusionMode, SourceType, SubtitleCue, Transcript
 from video2txt.pipeline import TranscriptionPipeline
 from video2txt.subtitles.parser import parse_subtitle_file
+from video2txt.translation.models import install_nllb_model
 
 app = typer.Typer(no_args_is_help=True, help="本地视频/音频转写与字幕融合工具。")
 
@@ -118,12 +119,10 @@ def extract_subtitles_command(
 def parse_subtitles_command(
     input_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
     output: Annotated[Path, typer.Option("--output", "-o", help="输出字幕 JSON 路径。")],
-    language: Annotated[str | None, typer.Option("--language", help="字幕语言标记。")]=None,
+    language: Annotated[str | None, typer.Option("--language", help="字幕语言标记。")] = None,
 ) -> None:
     """解析 SRT/ASS/VTT 并清理显示样式。"""
-    cues = parse_subtitle_file(
-        input_path, source=SourceType.EXTERNAL_SUBTITLE, language=language
-    )
+    cues = parse_subtitle_file(input_path, source=SourceType.EXTERNAL_SUBTITLE, language=language)
     import json
 
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -135,9 +134,7 @@ def parse_subtitles_command(
 @app.command("fuse-results")
 def fuse_results_command(
     asr_json: Annotated[Path, typer.Option("--asr-json", exists=True, dir_okay=False)],
-    subtitle_json: Annotated[
-        Path, typer.Option("--subtitle-json", exists=True, dir_okay=False)
-    ],
+    subtitle_json: Annotated[Path, typer.Option("--subtitle-json", exists=True, dir_okay=False)],
     output_dir: Annotated[Path, typer.Option("--output-dir", "-o")],
     mode: Annotated[FusionMode, typer.Option("--mode")] = FusionMode.VERBATIM,
     config: Annotated[Path | None, typer.Option("--config")] = None,
@@ -175,6 +172,21 @@ def transcribe(
     hard_subtitles: Annotated[
         bool, typer.Option("--hard-subtitles", help="识别画面下方的硬字幕。")
     ] = False,
+    translate_to_chinese: Annotated[
+        bool, typer.Option("--translate-to-chinese", help="额外导出中文字幕 SRT。")
+    ] = False,
+    engine: Annotated[
+        ASRMode,
+        typer.Option(
+            "--engine", help="local 使用 faster-whisper；api 使用千问 ASR 与 Codex CLI 翻译。"
+        ),
+    ] = ASRMode.LOCAL,
+    api_hotword: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--api-hotword", help="API 模式热词；可重复传入，例如 --api-hotword RedotPay。"
+        ),
+    ] = None,
     model_path: Annotated[Path | None, typer.Option("--model-path")] = None,
     config: Annotated[Path | None, typer.Option("--config")] = None,
     task_id: Annotated[str | None, typer.Option("--task-id")] = None,
@@ -191,9 +203,21 @@ def transcribe(
         subtitle_stream_index=subtitle_stream,
         external_subtitle=external_subtitle,
         hard_subtitles=hard_subtitles,
+        translate_to_chinese=translate_to_chinese,
+        asr_mode=engine,
+        api_hotwords=api_hotword,
         task_id=task_id,
     )
     typer.echo(manifest.model_dump_json(indent=2))
+
+
+@app.command("install-translation-models")
+def install_translation_models(
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    """下载一次阿拉伯语/英语到中文的离线翻译模型。"""
+    settings = load_settings(config)
+    typer.echo(str(install_nllb_model(settings.translation.model_path)))
 
 
 @app.command()
@@ -215,10 +239,6 @@ def serve(
     if model_path is not None:
         settings.asr.model_path = model_path
     uvicorn.run(create_app(settings), host=host, port=port, log_level="info")
-
-
-
-
 
 
 if __name__ == "__main__":
