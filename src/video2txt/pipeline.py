@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -35,6 +36,7 @@ from video2txt.models import (
 from video2txt.ocr.hard_subtitles import HardSubtitleProgress, extract_hard_subtitles
 from video2txt.subtitles.parser import parse_subtitle_file
 from video2txt.translation import CodexCLIChineseTranslator, NLLBChineseTranslator
+from video2txt.summary import SubtitleSummarizer
 
 
 def _now() -> str:
@@ -46,7 +48,14 @@ def _write_text_atomic(path: Path, content: str) -> None:
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     try:
         temporary.write_text(content, encoding="utf-8")
-        temporary.replace(path)
+        for attempt in range(5):
+            try:
+                temporary.replace(path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.02)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -79,12 +88,39 @@ class TranscriptionPipeline:
     def _write_manifest(self, manifest: TaskManifest) -> None:
         manifest.updated_at = _now()
         _write_model(manifest.work_dir / "task.json", manifest)
-        if manifest.status in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
+        if manifest.source_kind or manifest.summarize or manifest.status in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
             _write_model(manifest.output_dir / "task.json", manifest)
 
     def _set_status(self, manifest: TaskManifest, status: TaskStatus) -> None:
         manifest.status = status
         self._write_manifest(manifest)
+
+    def summarize_existing(self, manifest: TaskManifest) -> TaskManifest:
+        from video2txt.models import FusionSegment
+
+        manifest.summarize = True
+        manifest.summary_error = None
+        manifest.warnings = [w for w in manifest.warnings if not w.startswith("智能总结未完成：")]
+        self._set_status(manifest, TaskStatus.SUMMARIZING)
+        try:
+            payload = json.loads((manifest.output_dir / "fusion.json").read_text(encoding="utf-8"))
+            segments = [FusionSegment.model_validate(item) for item in payload["segments"]]
+            def progress(current: int, total: int) -> None:
+                manifest.progress = TaskProgress(stage="summarizing", current=current, total=total)
+                self._write_manifest(manifest)
+            report = SubtitleSummarizer(self.settings.codex_translation, manifest.work_dir).generate(
+                segments, manifest.original_filename or manifest.input_path.name, progress
+            )
+            for key, name in (("summary_md", "summary.md"), ("summary_txt", "summary.txt")):
+                path = manifest.output_dir / name
+                _write_text_atomic(path, report)
+                manifest.artifacts[key] = str(path)
+        except Exception as error:
+            manifest.summary_error = str(error)[:1000]
+            manifest.warnings.append("智能总结未完成：" + manifest.summary_error)
+        manifest.progress = None
+        self._set_status(manifest, TaskStatus.COMPLETED)
+        return manifest
 
     def _asr_cache_path(self, audio: Path, *, asr_mode: ASRMode, api_hotwords: list[str]) -> Path:
         options: dict[str, object] = {"mode": asr_mode.value}
@@ -138,6 +174,10 @@ class TranscriptionPipeline:
         translate_to_chinese: bool = False,
         asr_mode: ASRMode = ASRMode.LOCAL,
         api_hotwords: list[str] | None = None,
+        source_url: str | None = None,
+        source_kind: str | None = None,
+        recording_minutes: int | None = None,
+        summarize: bool = False,
     ) -> TaskManifest:
         source = input_path.resolve()
         if not source.is_file():
@@ -157,6 +197,10 @@ class TranscriptionPipeline:
             input_path=source,
             original_filename=original_filename,
             batch_id=batch_id,
+            source_url=source_url,
+            source_kind=source_kind,
+            recording_minutes=recording_minutes,
+            summarize=summarize,
             work_dir=work_dir,
             output_dir=result_dir,
             mode=mode,
@@ -375,6 +419,8 @@ class TranscriptionPipeline:
                     export_text(translated, result_dir / "translated_transcript_zh.txt")
                 )
 
+            if summarize:
+                return self.summarize_existing(manifest)
             self._set_status(manifest, TaskStatus.COMPLETED)
             return manifest
         except Exception as error:

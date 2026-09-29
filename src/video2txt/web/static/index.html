@@ -4,48 +4,55 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark" />
-    <title>Video2Txt · 视频转写工作台</title>
+    <title>影音内容助手</title>
     <meta
       name="description"
-      content="本地优先的视频音频转写与字幕融合工作台"
+      content="视频下载、直播录制、字幕转写与智能总结"
     />
-    <link rel="stylesheet" href="/styles.css?v=20260909-auto-language" />
+    <link rel="stylesheet" href="/styles.css?v=20260929-library-columns" />
   </head>
   <body>
-    <div class="noise" aria-hidden="true"></div>
-    <header class="topbar">
-      <a class="brand" href="/" aria-label="Video2Txt 首页">
-        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
-        <span>Video2Txt</span>
-      </a>
-      <div class="engine-pill" id="engine-pill">
-        <span class="status-dot"></span>
-        <span id="engine-label">正在检查本地引擎</span>
-      </div>
+    <header class="app-header" id="workbench">
+      <h1>影音内容助手</h1>
+      <nav class="main-nav" aria-label="主导航">
+        <a href="#workbench" class="active" aria-current="location"><span aria-hidden="true">⌂</span>工作台</a>
+        <a href="#content-library"><span aria-hidden="true">▱</span>内容库</a>
+        <a href="#storage"><span aria-hidden="true">▤</span>存储管理</a>
+      </nav>
     </header>
-
     <main>
-      <section class="hero">
-        <div class="eyebrow"><span>LOCAL-FIRST</span> 音频与字幕双通道校对</div>
-        <h1>把视频里的声音，<br /><em>整理成可信文本。</em></h1>
-        <p>
-          本地提取音轨并转写；检测到字幕时，按时间轴逐段对照，保留每一次融合依据。
-        </p>
-        <div class="trust-row" aria-label="产品特性">
-          <span>文件不出本机</span><span>词级时间戳</span><span>TXT · SRT</span>
-        </div>
-      </section>
-
       <section class="workspace" aria-label="转写工作台">
         <form id="task-form" class="control-card">
           <div class="card-heading">
             <div>
               <span class="step-number">01</span>
-              <h2>添加素材</h2>
+              <h2>新建任务</h2><span class="heading-hint">选择内容来源，粘贴链接并设置处理方式</span>
             </div>
-            <span class="file-limit">最多 30 个 · 单个 5 GB</span>
+            <span class="file-limit">最多 50 个 · 单个 5 GB</span>
           </div>
 
+          <fieldset class="source-picker">
+            <legend>1. 选择内容来源</legend>
+            <div class="mode-grid">
+              <label class="mode-option"><input type="radio" name="input_source" value="file" checked /><span><b>本地文件</b><small>上传视频或音频</small></span></label>
+              <label class="mode-option"><input type="radio" name="input_source" value="video" /><span><b>抖音视频</b><small>粘贴链接或分享文案</small></span></label>
+              <label class="mode-option"><input type="radio" name="input_source" value="live" /><span><b>抖音直播</b><small>多房间同时录制</small></span></label>
+            </div>
+          </fieldset>
+          <div id="douyin-inputs" hidden>
+            <label class="api-asr-field" for="douyin-url"><span>2. 粘贴分享文案或视频链接（可多个，自动提取）</span>
+              <textarea id="douyin-url" rows="3" maxlength="65536" placeholder="粘贴视频或直播间链接，也可以直接粘贴整段分享文案"></textarea>
+            </label>
+            <label class="api-asr-field" id="recording-options" for="recording-minutes" hidden>
+              <span>最长录制时间（分钟，0＝不限时，录到下播）</span>
+              <input id="recording-minutes" type="number" min="0" max="480" value="0" />
+              <small>本批直播间使用相同时长，每个直播间可单独结束。</small>
+            </label>
+            <p class="field-hint" id="douyin-hint">视频下载完成后自动转写，并保留原视频供下载。</p>
+            <p class="field-hint" id="douyin-health"></p>
+          </div>
+          <div id="local-inputs">
+          <p class="input-step">2. 添加视频、音频或外挂字幕</p>
           <label class="dropzone" id="media-dropzone" for="media-input">
             <input
               id="media-input"
@@ -77,18 +84,26 @@
             </label>
           </div>
 
-          <fieldset id="asr-engine-fieldset">
-            <legend>识别引擎</legend>
-            <div class="mode-grid">
-              <label class="mode-option">
-                <input type="radio" name="asr_mode" value="local" checked />
-                <span><b>本地模型</b><small>沿用 faster-whisper 与本机 NLLB 翻译</small></span>
-              </label>
-              <label class="mode-option">
-                <input type="radio" name="asr_mode" value="api" />
-                <span><b>千问 API</b><small>自动识别本地语种与英文，Codex CLI 翻译中文</small></span>
-              </label>
-            </div>
+          </div>
+            <fieldset class="processing-picker">
+              <legend>3. 选择处理方式</legend>
+              <div class="mode-grid">
+                <label class="mode-option" id="download-only-option" hidden><input type="radio" name="douyin_action" value="download" /><span><b>仅下载视频</b><small>保存视频或直播录像</small></span></label>
+                <label class="mode-option"><input type="radio" name="douyin_action" value="transcribe" checked /><span><b id="transcribe-action-label">转字幕</b><small>保留视频，同时生成 TXT 和 SRT</small></span></label>
+                <label class="mode-option"><input type="radio" name="douyin_action" value="summary" /><span><b>转字幕并智能总结</b><small>生成详尽归纳和内容速览报告</small></span></label>
+              </div>
+              <p class="field-hint" id="summary-hint" hidden>通过已登录的 Codex 调用大模型，字幕文本会发送给模型处理；长直播按录制片段分别生成报告。</p>
+            </fieldset>
+          <div id="transcription-options">
+          <div class="settings-row">
+            <label class="select-field" for="asr-mode-select">识别引擎
+              <select id="asr-mode-select" name="asr_mode"><option value="local">本地模型</option><option value="api">千问 API</option></select>
+            </label>
+            <label class="select-field" for="output-mode-select">输出方式
+              <select id="output-mode-select" name="mode"><option value="verbatim">逐字稿</option><option value="subtitle">字幕稿</option><option value="clean">整理稿</option></select>
+            </label>
+          </div>
+          <p class="field-hint" id="output-mode-hint">保留原话，字幕用于纠错。</p>
             <div id="api-asr-options" hidden>
               <div class="api-asr-fields">
                 <label class="api-asr-field" for="api-hotwords-input">
@@ -100,7 +115,7 @@ Apply Now</textarea>
               </div>
               <p class="field-hint" id="api-asr-hint">热词会自动记住；音频会上传到千问，原文与译文保存到本机。</p>
             </div>
-          </fieldset>
+
 
           <label class="feature-toggle" id="ocr-toggle">
             <input id="hard-subtitles-input" name="hard_subtitles" type="checkbox" value="true" />
@@ -115,29 +130,14 @@ Apply Now</textarea>
             <input id="translate-to-chinese-input" name="translate_to_chinese" type="checkbox" value="true" />
             <span class="toggle-track" aria-hidden="true"><i></i></span>
             <span class="toggle-copy">
-              <b>额外生成中文字幕</b>
+              <b>生成中文字幕</b>
               <small id="translation-hint">开始提取前勾选才会生成中文文件；本地模式使用离线 NLLB 翻译；右侧下载类型只决定导出范围。</small>
             </span>
           </label>
 
-          <fieldset>
-            <legend>输出方式</legend>
-            <div class="mode-grid">
-              <label class="mode-option">
-                <input type="radio" name="mode" value="verbatim" checked />
-                <span><b>逐字稿</b><small>保留原话，字幕用于纠错</small></span>
-              </label>
-              <label class="mode-option">
-                <input type="radio" name="mode" value="subtitle" />
-                <span><b>字幕稿</b><small>字幕优先，ASR 补充遗漏</small></span>
-              </label>
-              <label class="mode-option">
-                <input type="radio" name="mode" value="clean" />
-                <span><b>整理稿</b><small>对比后去填充、去重复、补标点并分段</small></span>
-              </label>
-            </div>
-          </fieldset>
 
+
+          </div>
           <button class="primary-button" id="submit-button" type="submit">
             <span>开始批量提取与转写</span><b aria-hidden="true">→</b>
           </button>
@@ -151,7 +151,7 @@ Apply Now</textarea>
           <div class="card-heading">
             <div>
               <span class="step-number">02</span>
-              <h2>批次进度</h2>
+              <h2>任务队列</h2>
             </div>
             <span class="task-state" id="task-state">等待素材</span>
           </div>
@@ -165,6 +165,11 @@ Apply Now</textarea>
           </div>
 
           <div class="batch-result" id="batch-result" hidden>
+            <div class="queue-tabs" aria-label="任务状态筛选">
+              <button type="button" data-queue-filter="all" aria-pressed="true">全部任务</button>
+              <button type="button" data-queue-filter="active" aria-pressed="false">处理中</button>
+              <button type="button" data-queue-filter="completed" aria-pressed="false">已完成</button>
+            </div>
             <div class="batch-overview">
               <div><small>任务总数</small><strong id="batch-total">0</strong></div>
               <div><small>已完成</small><strong id="batch-completed">0</strong></div>
@@ -172,7 +177,10 @@ Apply Now</textarea>
             </div>
             <div class="batch-progress"><span id="batch-progress-bar"></span></div>
             <p class="batch-estimate" id="batch-estimate">预计完成时间：等待任务提交</p>
-            <div class="queue-list" id="queue-list"></div>
+            <div class="queue-table" role="table" aria-label="任务队列">
+              <div class="queue-table-head" role="row"><span role="columnheader">#</span><span role="columnheader">内容信息</span><span role="columnheader">来源</span><span role="columnheader">处理方式</span><span role="columnheader">进度</span><span role="columnheader">状态</span><span role="columnheader">操作</span></div>
+              <div class="queue-list" id="queue-list" role="rowgroup"></div>
+            </div>
             <div class="batch-actions">
               <p class="task-hint">任务按顺序在本机处理，可以保留此页面继续运行。</p>
               <div class="export-controls">
@@ -181,6 +189,7 @@ Apply Now</textarea>
                 <label class="export-option"><input type="checkbox" data-batch-export-type value="subtitle" /><i></i>字幕文件</label>
                 <label class="export-option"><input type="checkbox" data-batch-export-type value="translation" /><i></i>中文字幕文件</label>
                 <label class="export-option"><input type="checkbox" data-batch-export-type value="translation_text" /><i></i>中文文本文件</label>
+                <label class="export-option"><input type="checkbox" data-batch-export-type value="summary" /><i></i>总结报告</label>
                 <a id="batch-export" class="batch-export" aria-disabled="true">批量下载</a>
               </div>
             </div>
@@ -197,15 +206,26 @@ Apply Now</textarea>
               <div class="panel-title"><span>文本预览</span><button id="copy-button" type="button">复制</button></div>
               <pre id="transcript-preview"></pre>
             </div>
+            <div class="transcript-panel" id="summary-panel" hidden>
+              <div class="panel-title"><span>智能总结报告</span><button id="generate-summary" type="button">生成总结</button></div>
+              <p class="field-hint" id="summary-result-hint"></p>
+              <pre id="summary-preview" hidden></pre>
+              <div id="summary-downloads" hidden>
+                <a id="summary-download-md" class="small-button">下载报告（Markdown）</a>
+                <a id="summary-download-txt" class="small-button">下载报告（TXT）</a>
+              </div>
+            </div>
             <div class="download-row" id="download-row">
               <span>下载类型</span>
               <label class="export-option"><input type="checkbox" data-task-export-type value="text" checked /><i></i>文本文件</label>
               <label class="export-option"><input type="checkbox" data-task-export-type value="subtitle" /><i></i>字幕文件</label>
               <label class="export-option"><input type="checkbox" data-task-export-type value="translation" /><i></i>中文字幕文件</label>
               <label class="export-option"><input type="checkbox" data-task-export-type value="translation_text" /><i></i>中文文本文件</label>
+              <label class="export-option"><input type="checkbox" data-task-export-type value="summary" /><i></i>总结报告</label>
               <a id="task-export" class="primary-download">下载</a>
             </div>
             <p class="warning-text" id="warning-text"></p>
+            <a id="source-download" class="small-button" hidden>下载原视频 / 直播录像</a>
             <div class="task-actions"><button type="button" id="delete-completed-task" class="danger-button">删除任务</button></div>
           </div>
 
@@ -223,14 +243,13 @@ Apply Now</textarea>
         </section>
       </section>
 
-      <section class="history-section">
+      <section class="history-section" id="content-library">
         <div class="section-heading">
-          <div><span class="step-number">03</span><h2>最近任务</h2></div>
+          <div><span class="step-number">03</span><h2>内容库</h2></div>
           <button type="button" id="refresh-history">刷新</button>
         </div>
-        <div class="history-list" id="history-list">
-          <p class="history-empty">暂无历史任务</p>
-        </div>
+<div class="queue-table" role="table" aria-label="内容库">              <div class="queue-table-head" role="row"><span role="columnheader">#</span><span role="columnheader">内容信息</span><span role="columnheader">来源</span><span role="columnheader">处理方式</span><span role="columnheader">操作</span></div>
+<div class="queue-list history-list" id="history-list" role="rowgroup"></div></div>
         <nav class="history-pagination" id="history-pagination" aria-label="任务历史分页" hidden>
           <button type="button" id="history-previous">← 上一页</button>
           <span id="history-page-info"></span>
@@ -238,7 +257,7 @@ Apply Now</textarea>
         </nav>
       </section>
 
-      <section class="storage-section">
+      <section class="storage-section" id="storage">
         <div class="section-heading">
           <div><span class="step-number">04</span><h2>存储空间</h2></div>
           <button type="button" id="refresh-storage">刷新</button>
@@ -258,7 +277,10 @@ Apply Now</textarea>
       </section>
     </main>
 
-    <footer><span>Video2Txt v<span id="app-version">2.0.0</span></span><span>本地处理 · 可追溯融合</span></footer>
-    <script src="/app.js?v=20260909-hotword-storage" defer></script>
+    <footer>
+      <div class="engine-pill" id="engine-pill" hidden><span class="status-dot"></span><span id="engine-label">正在检查本地引擎</span></div>
+      <span class="version">v<span id="app-version">2.0.0</span></span>
+    </footer>
+    <script src="/app.js?v=20260929-library-columns" defer></script>
   </body>
 </html>

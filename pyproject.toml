@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "video2txt"
 version = "2.0.0"
-description = "Local-first video/audio transcription and subtitle fusion"
+description = "Media content assistant for video downloads, live recording, transcription and AI summaries"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 dependencies = [
@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-qwen-test = ["requests>=2.32,<3"]
+douyin = ["requests>=2.33.1,<3", "yt-dlp>=2026.8.19", "streamget>=4.0.10,<5"]
 api = ["requests>=2.32,<3"]
 asr = ["faster-whisper>=1.2,<2"]
 subtitles = [

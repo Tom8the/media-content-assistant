@@ -2,6 +2,8 @@ const $ = (selector) => document.querySelector(selector);
 const terminalStatuses = new Set(["completed", "failed", "cancelled"]);
 const statusLabels = {
   queued: "等待处理",
+  downloading: "获取抖音素材",
+  recording: "直播录制中",
   probing: "分析媒体",
   extracting: "提取音轨",
   transcribing: "语音转写",
@@ -9,6 +11,7 @@ const statusLabels = {
   aligning: "时间轴对齐",
   exporting: "生成结果",
   translating: "翻译中文字幕",
+  summarizing: "生成智能总结",
   completed: "已完成",
   failed: "失败",
   cancelled: "已取消",
@@ -19,6 +22,8 @@ const estimateHardSubtitleFactor = 0.9;
 const estimateSecondsPerMB = 1.85;
 const apiHotwordsStorageKey = "video2txt.api-hotwords.v1";
 
+const unavailableThumbnails = new Set();
+let queueFilter = "all";
 let currentBatchId = null;
 let currentBatch = null;
 let currentTaskId = null;
@@ -26,6 +31,65 @@ let pollTimer = null;
 let historyPage = 1;
 const historyPageSize = 12;
 let healthState = null;
+
+function selectedSource() {
+  return document.querySelector('input[name="input_source"]:checked')?.value || "file";
+}
+
+function downloadOnly() {
+  return selectedSource() !== "file" && document.querySelector('input[name="douyin_action"]:checked')?.value === "download";
+}
+
+function wantsSummary() {
+  return document.querySelector('input[name="douyin_action"]:checked')?.value === "summary";
+}
+
+function updateSourceControls() {
+  const source = selectedSource();
+  $("#download-only-option").hidden = source === "file";
+  if (source === "file" && document.querySelector('input[name="douyin_action"]:checked')?.value === "download") {
+    document.querySelector('input[name="douyin_action"][value="transcribe"]').checked = true;
+  }
+  $("#transcribe-action-label").textContent = source === "file" ? "转字幕" : "下载后转字幕";
+  $("#summary-hint").hidden = !wantsSummary();
+  $("#local-inputs").hidden = source !== "file";
+  $("#douyin-inputs").hidden = source === "file";
+  $("#recording-options").hidden = source !== "live";
+  $("#media-input").required = source === "file";
+  $("#douyin-url").required = source !== "file";
+  $("#douyin-url").disabled = source === "file";
+  $("#recording-minutes").disabled = source !== "live";
+  $("#douyin-url").rows = 3;
+  const liveLimit = healthState?.max_live_recordings || 10;
+  $("#douyin-url").placeholder = source === "video" ? "直接粘贴抖音分享文案或链接，支持多条、多行混合粘贴。自动提取并去重，最多 50 个视频链接。" : `粘贴多个直播间链接或分享文案，可用回车分隔。自动提取并去重，最多 ${liveLimit} 个直播间同时录制。`;
+  document.querySelector(".file-limit").textContent = source === "live" ? `最多同时 ${liveLimit} 个直播间 · 每小时分段` : "最多 50 个 · 单个 5 GB";
+  $("#douyin-hint").textContent = source === "live"
+    ? "0 表示不限时，录到下播；也可随时结束录制。约每小时保存一段，结束后逐段转字幕。请保持服务运行。"
+    : "视频下载完成后自动转写，并保留原视频供下载。";
+  $("#submit-button span").textContent = source === "live" ? "批量录制并转字幕" : source === "video" ? "批量下载并转字幕" : "开始批量提取与转写";
+  $("#transcription-options").hidden = downloadOnly();
+  if (downloadOnly()) {
+    $("#douyin-hint").textContent = source === "live" ? "0 表示不限时，录到下播；也可随时结束录制。约每小时保存一个 MKV 文件，结束后可分别下载。请保持服务运行。" : "下载并保存原视频，不进行语音识别或字幕转写。";
+    $("#submit-button span").textContent = source === "live" ? "开始批量录制" : "开始批量下载";
+  }
+  updateAsrControls();
+  if (wantsSummary()) $("#submit-button span").textContent = source === "live" ? "批量录制、转字幕并总结" : source === "video" ? "批量下载、转字幕并总结" : "开始转字幕并总结";
+}
+
+function updateDouyinAvailability() {
+  if (wantsSummary() && !healthState?.summary_available) {
+    $("#submit-button").disabled = true;
+    $("#summary-hint").textContent = "智能总结尚未就绪，请安装并登录 Codex CLI 后重启服务。";
+  } else {
+    $("#summary-hint").textContent = "通过已登录的 Codex 调用大模型，字幕文本会发送给模型处理；长直播按录制片段分别生成报告。";
+  }
+  const source = selectedSource();
+  if (source === "file") return;
+  const available = healthState?.[source === "live" ? "douyin_live_available" : "douyin_video_available"];
+  $("#douyin-health").textContent = !available ? "抖音下载组件尚未就绪，请安装后重启服务。"
+    : healthState?.douyin_cookie_configured ? "已配置抖音访问凭据。" : "可先直接尝试；遇到平台验证时需配置抖音 Cookie。";
+  if (!available) $("#submit-button").disabled = true;
+}
 
 function restoreApiHotwords() {
   try {
@@ -45,10 +109,15 @@ function saveApiHotwords() {
 }
 
 function selectedAsrMode() {
-  return document.querySelector('input[name="asr_mode"]:checked')?.value || "local";
+  return $("#asr-mode-select").value || "local";
 }
 
 function updateAsrControls() {
+  if (downloadOnly()) {
+    $("#submit-button").disabled = false;
+    updateDouyinAvailability();
+    return;
+  }
   const isApi = selectedAsrMode() === "api";
   const health = healthState || {};
   $("#api-asr-options").hidden = !isApi;
@@ -59,6 +128,7 @@ function updateAsrControls() {
     translation.disabled = true;
     translationHint.textContent = "API 模式固定由本机 Codex CLI 翻译为简体中文；会同时导出中文 TXT 和 SRT。";
     $("#submit-button").disabled = !health.api_pipeline_available;
+    updateDouyinAvailability();
     return;
   }
   translation.disabled = !health.translation_models_available;
@@ -66,6 +136,7 @@ function updateAsrControls() {
     ? "开始提取前勾选才会生成中文文件；本地模式使用离线 NLLB 翻译。"
     : "离线翻译模型尚未安装";
   $("#submit-button").disabled = !health.model_configured;
+  updateDouyinAvailability();
 }
 
 function escapeHtml(value) {
@@ -98,6 +169,12 @@ function ocrProgress(task) {
 }
 
 function taskStatusLabel(task) {
+  if (task.status === "completed" && task.summary_error) return "字幕完成 · 总结待重试";
+  if (task.status === "summarizing" && task.progress?.total) return `智能总结 ${task.progress.current}/${task.progress.total}`;
+  if (task.status === "recording" && task.progress) return task.progress.total
+    ? `录制 ${Math.floor(task.progress.current / 60)} / ${Math.ceil(task.progress.total / 60)} 分钟`
+    : `已录制 ${Math.floor(task.progress.current / 60)} 分钟 · 不限时`;
+  if (task.status === "downloading" && task.progress?.total) return `下载 ${Math.min(100, Math.round(task.progress.current / task.progress.total * 100))}%`;
   return ocrProgress(task)?.short || statusLabels[task.status] || task.status;
 }
 
@@ -110,7 +187,7 @@ function exportQuery(types) {
 }
 
 function exportTypeLabel(types) {
-  const labels = { text: "文本", subtitle: "原字幕", translation: "中文字幕", translation_text: "中文文本" };
+  const labels = { text: "文本", subtitle: "原字幕", translation: "中文字幕", translation_text: "中文文本", summary: "总结报告" };
   return types.map((type) => labels[type] || type).join(" + ");
 }
 
@@ -135,6 +212,10 @@ function renderBatchEstimate(tasks, allFinished) {
     $("#batch-estimate").textContent = "本批次处理已结束";
     return;
   }
+  if (tasks.some((task) => task.source_kind && ["queued", "downloading", "recording"].includes(task.status))) {
+    $("#batch-estimate").textContent = "媒体获取完成后开始转写；直播录制可提前停止。";
+    return;
+  }
   let remaining = 0;
   for (const task of tasks) {
     if (terminalStatuses.has(task.status)) continue;
@@ -156,7 +237,7 @@ function renderBatchEstimate(tasks, allFinished) {
 }
 
 function showPanel(name) {
-  ["empty", "batch", "completed", "failed"].forEach((panel) => {
+  ["completed", "failed"].forEach((panel) => {
     $(`#${panel}-result`).hidden = panel !== name;
   });
 }
@@ -183,70 +264,73 @@ function updateSubtitleLabel() {
     : "可批量选择，按同名媒体自动配对";
 }
 
-function renderBatch(batch) {
-  currentBatch = batch;
-  showPanel("batch");
-  const tasks = batch.tasks || [];
-  const completed = tasks.filter((task) => task.status === "completed").length;
-  const failed = tasks.filter((task) => task.status === "failed").length;
-  const terminal = tasks.filter((task) => terminalStatuses.has(task.status)).length;
-  const allFinished = tasks.length > 0 && terminal === tasks.length;
-  const activeTask = tasks.find((task) => !terminalStatuses.has(task.status));
-  $("#batch-total").textContent = tasks.length;
-  $("#batch-completed").textContent = completed;
-  $("#batch-failed").textContent = failed;
-  $("#batch-progress-bar").style.width = `${tasks.length ? Math.round(terminal / tasks.length * 100) : 0}%`;
-  renderBatchEstimate(tasks, allFinished);
-  $("#task-state").textContent = allFinished
-    ? `${completed} 个已完成`
-    : `${terminal}/${tasks.length} 已处理${activeTask ? ` · ${taskStatusLabel(activeTask)}` : ""}`;
-  $("#queue-list").innerHTML = tasks.map((task) => {
+function renderTaskRow(task, index, library = false) {
+
     const canView = terminalStatuses.has(task.status);
-    const progress = ocrProgress(task);
-    const normalDetail = [
-      formatBytes(task.media_size),
-      modeLabels[task.mode] || task.mode,
-      task.hard_subtitles ? "硬字幕 OCR" : "",
-      task.asr_mode === "api" ? "千问 API + Codex 翻译" : "本地模型",
-      task.translate_to_chinese ? "中文字幕" : "",
-    ].filter(Boolean).join(" · ");
-    const detail = task.status === "failed"
-      ? escapeHtml(task.error || "处理失败")
-      : escapeHtml(progress?.detail || normalDetail);
-    const progressBar = progress
-      ? `<div class="queue-progress" aria-label="OCR 进度 ${progress.percent}%"><span style="width:${progress.percent}%"></span></div>`
-      : "";
-    return `<article class="queue-item">
-      <div><strong title="${escapeHtml(task.original_filename)}">${escapeHtml(task.original_filename || task.task_id)}</strong><small>${detail}</small>${progressBar}</div>
-      <span class="queue-status ${escapeHtml(task.status)}">${escapeHtml(taskStatusLabel(task))}</span>
-      <button type="button" data-batch-task-id="${escapeHtml(task.task_id)}" ${canView ? "" : "disabled"}>查看${canView ? "结果" : ""} →</button>
+    const source = task.source_kind === "live" ? "抖音直播" : task.source_kind === "video" ? "抖音视频" : "本地文件";
+    const treatment = task.transcribe_after_download === false ? "仅下载视频" : task.summarize ? "转字幕并智能总结" : task.source_kind ? "下载后转字幕" : "转字幕";
+    const details = task.transcribe_after_download === false ? "保留原视频" : [modeLabels[task.mode], task.asr_mode === "api" ? "千问 API" : "本地模型", task.hard_subtitles ? "硬字幕识别" : "", task.translate_to_chinese ? "中文字幕" : ""].filter(Boolean).join(" · ");
+    const progress = task.progress;
+    const measurable = progress?.total > 0;
+    const percent = task.status === "completed" ? 100 : measurable ? Math.max(0, Math.min(100, Math.round(progress.current / progress.total * 100))) : null;
+    const progressText = percent !== null ? `${percent}%` : task.status === "recording" ? "持续录制" : task.status === "failed" ? "未完成" : task.status === "queued" ? "等待中" : "处理中";
+    const meta = [task.created_at?.replace("T", " ").slice(0, 16), formatBytes(task.media_size)].filter(Boolean).join(" · ");
+    const duration = task.media_duration ? `${Math.floor(task.media_duration / 60)}:${String(Math.floor(task.media_duration % 60)).padStart(2, "0")}` : "";
+    const thumbKey = `${task.task_id}:${task.status}:${Math.floor(Date.now() / 30000)}`;
+    const thumbnail = `<div class="task-thumbnail"><span aria-hidden="true">${task.source_kind === "live" ? "◉" : "▷"}</span>${unavailableThumbnails.has(thumbKey) ? "" : `<img data-thumb-key="${escapeHtml(thumbKey)}" src="/api/tasks/${encodeURIComponent(task.task_id)}/thumbnail?v=${Math.floor(Date.now() / 30000)}" alt="" loading="lazy" />`}${duration ? `<small>${duration}</small>` : ""}</div>`;
+    return `<article class="queue-item" role="row">
+      <div class="queue-number" role="cell">${index + 1}</div>
+      <div class="queue-content" role="cell">${thumbnail}<div><strong title="${escapeHtml(task.original_filename)}">${escapeHtml(task.original_filename || task.task_id)}</strong><small>${escapeHtml(meta)}</small>${task.status === "failed" ? `<small class="queue-error">${escapeHtml(task.error || "处理失败")}</small>` : ""}</div></div>
+      <div role="cell"><span class="source-badge">${source}</span></div>
+      <div class="queue-treatment" role="cell"><strong>${treatment}</strong><small>${escapeHtml(details)}</small></div>
+      ${library ? "" : `<div class="queue-meter" role="cell"><div class="queue-progress ${percent === null && !terminalStatuses.has(task.status) ? "indeterminate" : ""}" ${percent === null ? '' : `role="progressbar" aria-valuenow="${percent}" aria-valuemin="0" aria-valuemax="100"`} aria-label="${escapeHtml(progressText)}"><span style="width:${percent ?? 30}%"></span></div><small>${progressText}</small></div>
+      <div role="cell"><span class="queue-status ${escapeHtml(task.status)}">${escapeHtml(taskStatusLabel(task))}</span></div>`}
+      <div class="queue-actions" role="cell">
+      ${task.source_kind === "live" && ["queued", "downloading", "recording"].includes(task.status) && !task.source_media_available ? `<button type="button" data-stop-task-id="${escapeHtml(task.task_id)}">结束录制</button>` : ""}
+      ${task.source_media_available ? `<a href="/api/tasks/${escapeHtml(task.task_id)}/source">下载原视频</a>` : ""}
+      <button type="button" ${library ? "data-task-id" : "data-batch-task-id"}="${escapeHtml(task.task_id)}" ${canView ? "" : "disabled"}>${task.summary_preview ? "查看报告" : "查看结果"}</button>
+      ${library && task.status === "completed" && task.transcribe_after_download !== false ? `<a href="/api/tasks/${escapeHtml(task.task_id)}/export?types=text&types=subtitle${task.translate_to_chinese ? "&types=translation&types=translation_text" : ""}${task.summarize && !task.summary_error ? "&types=summary" : ""}">下载文件</a>` : ""}
+      ${library && task.status === "failed" ? `<button type="button" data-retry-task-id="${escapeHtml(task.task_id)}">重试</button>` : ""}
+      ${library ? `<button type="button" class="danger-button" data-delete-task-id="${escapeHtml(task.task_id)}">删除</button>` : ""}
+      </div>
     </article>`;
-  }).join("");
-  const exportLink = $("#batch-export");
-  const exportTypes = selectedExportTypes("data-batch-export-type");
-  const canExport = allFinished && completed > 0 && exportTypes.length > 0;
-  exportLink.setAttribute("aria-disabled", String(!canExport));
-  if (canExport) {
-    exportLink.href = `/api/batches/${batch.batch_id}/export.zip?${exportQuery(exportTypes)}`;
-    exportLink.textContent = `下载 ${completed} 个${exportTypeLabel(exportTypes)}（ZIP）`;
-  } else {
-    exportLink.removeAttribute("href");
-    exportLink.textContent = "批量下载";
-  }
-  $("#completed-back").hidden = false;
-  $("#failed-back").hidden = false;
-  if (allFinished) $("#submit-button").disabled = false;
+
+}
+
+function renderBatch(batch) {
+  showPanel("batch");
+  currentBatch = batch;
+  loadHistory();
 }
 
 function renderCompleted(task) {
   currentTaskId = task.task_id;
   showPanel("completed");
   $("#task-state").textContent = "已完成";
-  $("#completed-mode").textContent = modeLabels[task.mode] || task.mode;
-  $("#completed-file-count").textContent = task.translate_to_chinese ? "TXT / SRT / 中文字幕 / 中文文本" : "TXT / SRT";
+  const onlyVideo = task.transcribe_after_download === false;
+  $("#completed-mode").textContent = onlyVideo ? "仅下载视频" : modeLabels[task.mode] || task.mode;
+  $(".transcript-panel").hidden = onlyVideo;
+  $("#download-row").hidden = onlyVideo;
+  $("#completed-file-count").textContent = onlyVideo ? "视频文件" : task.translate_to_chinese ? "TXT / SRT / 中文字幕 / 中文文本" : "TXT / SRT";
   $("#transcript-preview").textContent = task.transcript_preview || "没有可预览文本";
   updateTaskExportLink();
   $("#warning-text").textContent = task.warnings?.filter((item) => item !== "ASR cache hit").join(" · ") || "";
+  $("#source-download").hidden = !task.source_media_available;
+  $("#source-download").href = `/api/tasks/${task.task_id}/source`;
+  $("#summary-panel").hidden = onlyVideo;
+  $("#summary-preview").hidden = !task.summary_preview;
+  $("#summary-preview").textContent = task.summary_preview || "";
+  $("#summary-downloads").hidden = !task.summary_preview;
+  $("#summary-download-md").href = `/api/tasks/${task.task_id}/files/summary.md`;
+  $("#summary-download-txt").href = `/api/tasks/${task.task_id}/files/summary.txt`;
+  $("#summary-result-hint").textContent = task.summary_error ? `总结未完成，字幕已保留：${task.summary_error}` : task.summary_preview ? "根据转写字幕生成，未分析画面；重要信息请核对原视频。" : "可直接使用已有字幕生成报告，无需重新下载或转写。字幕会发送给 Codex 大模型处理。";
+  $("#generate-summary").textContent = task.summary_error ? "重试总结" : task.summary_preview ? "重新生成总结" : "生成总结";
+  $("#generate-summary").disabled = !healthState?.summary_available;
+  $("#generate-summary").hidden = Boolean(task.summary_preview && !task.summary_error);
+  const summaryExport = document.querySelector('input[data-task-export-type][value="summary"]');
+  summaryExport.closest("label").hidden = !task.summary_preview;
+  if (!task.summary_preview) summaryExport.checked = false;
+  updateTaskExportLink();
   $("#completed-back").hidden = false;
   $("#completed-back").textContent = currentBatch ? "← 返回任务队列" : "← 返回最近任务";
   loadHistory();
@@ -284,7 +368,13 @@ async function viewTask(taskId, restoreBatch = false) {
     }
     $("#form-error").textContent = "";
     if (task.status === "completed") renderCompleted(task);
-    else if (task.status === "failed") renderFailed(task);
+    else if (task.status === "failed" || task.status === "cancelled") renderFailed(task);
+    else if (currentBatch) {
+      currentTaskId = null;
+      renderBatch(currentBatch);
+      clearInterval(pollTimer);
+      pollTimer = setInterval(pollBatch, 1000);
+    }
   } catch (error) {
     currentTaskId = previousTaskId;
     throw error;
@@ -360,13 +450,45 @@ function uploadBatch(formData) {
 async function submitForm(event) {
   event.preventDefault();
   $("#form-error").textContent = "";
+  if (selectedSource() !== "file") {
+    $("#submit-button").disabled = true;
+    try {
+      // Do not upload local files from the hidden input when submitting a link.
+      const source = selectedSource();
+      const data = new FormData();
+      data.set("url", $("#douyin-url").value);
+      data.set("source_kind", source);
+      data.set("transcribe_after_download", String(!downloadOnly()));
+      data.set("summarize", String(wantsSummary()));
+      data.set("recording_minutes", source === "live" ? $("#recording-minutes").value : "30");
+      data.set("mode", $("#output-mode-select").value);
+      data.set("asr_mode", selectedAsrMode());
+      data.set("hard_subtitles", String($("#hard-subtitles-input").checked));
+      data.set("translate_to_chinese", String($("#translate-to-chinese-input").checked));
+      data.set("api_hotwords", $("#api-hotwords-input").value);
+      const batch = await requestJson("/api/douyin", { method: "POST", body: data });
+      clearInterval(pollTimer);
+      currentTaskId = null;
+      currentBatchId = batch.batch_id;
+      renderBatch(batch);
+      pollTimer = setInterval(pollBatch, 1000);
+      await loadHistory();
+    } catch (error) {
+      $("#form-error").textContent = error.message;
+    } finally {
+      updateAsrControls();
+    }
+    return;
+  }
   const mediaFiles = [...$("#media-input").files];
   if (!mediaFiles.length) { $("#form-error").textContent = "请先选择视频或音频。"; return; }
-  if (mediaFiles.length > 30) { $("#form-error").textContent = "单批最多选择 30 个媒体文件。"; return; }
+  if (mediaFiles.length > 50) { $("#form-error").textContent = "单批最多选择 50 个媒体文件。"; return; }
   resetBatchProgress(mediaFiles.length);
   $("#submit-button").disabled = true;
   try {
-    const batch = await uploadBatch(new FormData(event.currentTarget));
+    const data = new FormData(event.currentTarget);
+    data.set("summarize", String(wantsSummary()));
+    const batch = await uploadBatch(data);
     currentBatchId = batch.batch_id;
     currentBatch = batch;
     $("#upload-progress-bar").style.width = "100%";
@@ -410,45 +532,45 @@ async function loadHealth() {
   }
 }
 
+const tableMarkup = new Map();
+function updateTable(selector, html) {
+  if (tableMarkup.get(selector) !== html) {
+    $(selector).innerHTML = html;
+    tableMarkup.set(selector, html);
+  }
+}
+let dashboardLoading = false;
 async function loadHistory(page = historyPage) {
+  historyPage = Math.max(1, page);
+  if (dashboardLoading) return;
+  dashboardLoading = true;
   try {
-    historyPage = Math.max(1, page);
-    const response = await fetch(`/api/tasks?page=${historyPage}&page_size=${historyPageSize}`, { cache: "no-store" });
-    const { tasks, total = 0, total_pages: totalPages = 1 } = await response.json();
-    if (!tasks.length && total > 0 && historyPage > 1) {
-      await loadHistory(historyPage - 1);
-      return;
+    const first = await requestJson("/api/tasks?page=1&page_size=100");
+    const tasks = [...first.tasks];
+    for (let p = 2; p <= first.total_pages; p++) {
+      const next = await requestJson(`/api/tasks?page=${p}&page_size=100`);
+      tasks.push(...next.tasks);
     }
-    if (!tasks.length) {
-      $("#history-list").innerHTML = '<p class="history-empty">暂无历史任务</p>';
-      $("#history-pagination").hidden = true;
-      return;
-    }
-    $("#history-list").innerHTML = tasks.map((task) => `
-      <article class="history-item">
-        <div><strong>${escapeHtml(task.original_filename || task.task_id.slice(0, 10))}</strong><small>${escapeHtml(task.updated_at || "")} · ${escapeHtml(modeLabels[task.mode] || task.mode)}</small></div>
-        <span class="history-status">${task.status === "completed" ? "已完成" : escapeHtml(statusLabels[task.status] || task.status)}</span>
-        <div class="history-actions">
-          <button type="button" data-task-id="${escapeHtml(task.task_id)}">查看结果 →</button>
-          ${task.status === "completed" ? `<details class="history-download">
-            <summary>下载</summary>
-            <div class="history-download-menu">
-              <a href="/api/tasks/${escapeHtml(task.task_id)}/export?types=text">文本文件</a>
-              <a href="/api/tasks/${escapeHtml(task.task_id)}/export?types=subtitle">字幕文件</a>
-              ${task.download_files?.includes("translated_subtitles_zh.srt") ? `<a href="/api/tasks/${escapeHtml(task.task_id)}/export?types=translation">中文字幕文件</a>` : ""}
-              ${task.download_files?.includes("translated_transcript_zh.txt") ? `<a href="/api/tasks/${escapeHtml(task.task_id)}/export?types=translation_text">中文文本文件</a>` : ""}
-              <a href="/api/tasks/${escapeHtml(task.task_id)}/export?types=text&types=subtitle${task.download_files?.includes("translated_subtitles_zh.srt") ? "&types=translation" : ""}${task.download_files?.includes("translated_transcript_zh.txt") ? "&types=translation_text" : ""}">全部</a>
-            </div>
-          </details>` : ""}
-          ${task.status === "failed" ? `<button type="button" data-retry-task-id="${escapeHtml(task.task_id)}">重试</button>` : ""}
-          ${terminalStatuses.has(task.status) ? `<button type="button" class="danger-button" data-delete-task-id="${escapeHtml(task.task_id)}">删除</button>` : ""}
-        </div>
-      </article>`).join("");
+    const unique = [...new Map(tasks.map(task => [task.task_id, task])).values()];
+    const active = unique.filter(task => !terminalStatuses.has(task.status));
+    const finished = unique.filter(task => terminalStatuses.has(task.status));
+    $("#batch-result").hidden = false;
+    $("#empty-result").hidden = true;
+    updateTable("#queue-list", active.length ? active.map((task, index) => renderTaskRow(task, index)).join("") : '<p class="history-empty">暂无执行中的任务，已结束的任务请在内容库查看。</p>');
+    $("#task-state").textContent = `${active.length} 个任务执行中`;
+    $("#batch-total").textContent = active.length;
+    $("#batch-estimate").textContent = "显示所有批次正在排队、下载、录制、转写或总结的任务；任务结束后自动移入内容库。";
+    const totalPages = Math.max(1, Math.ceil(finished.length / historyPageSize));
+    historyPage = Math.min(historyPage, totalPages);
+    const start = (historyPage - 1) * historyPageSize;
+    updateTable("#history-list", finished.slice(start, start + historyPageSize).map((task, index) => renderTaskRow(task, start + index, true)).join("") || '<p class="history-empty">暂无已结束的内容</p>');
     $("#history-pagination").hidden = totalPages <= 1;
-    $("#history-page-info").textContent = `第 ${historyPage} / ${totalPages} 页 · 共 ${total} 个任务`;
+    $("#history-page-info").textContent = `第 ${historyPage} / ${totalPages} 页 · 共 ${finished.length} 个已结束任务`;
     $("#history-previous").disabled = historyPage <= 1;
     $("#history-next").disabled = historyPage >= totalPages;
-  } catch { /* 页面主体仍可使用 */ }
+  } catch (error) {
+    $("#task-state").textContent = "任务状态刷新失败，稍后重试";
+  } finally { dashboardLoading = false; }
 }
 
 async function requestJson(url, options = {}) {
@@ -558,6 +680,34 @@ function updateTaskExportLink() {
 }
 
 $("#task-form").addEventListener("submit", submitForm);
+$("#generate-summary").addEventListener("click", async () => {
+  const taskId = currentTaskId;
+  if (!taskId) return;
+  $("#generate-summary").disabled = true;
+  try {
+    await requestJson(`/api/tasks/${taskId}/summarize`, { method: "POST" });
+    $("#task-state").textContent = "正在生成总结";
+    $("#summary-result-hint").textContent = "正在根据已有字幕生成报告，请稍候…";
+    clearInterval(pollTimer);
+    const timer = setInterval(async () => {
+      if (currentTaskId !== taskId) { clearInterval(timer); return; }
+      try {
+        const task = await requestJson(`/api/tasks/${taskId}`);
+        if (currentTaskId !== taskId) return;
+        $("#task-state").textContent = taskStatusLabel(task);
+        if (terminalStatuses.has(task.status)) {
+          clearInterval(timer);
+          if (task.status === "completed") renderCompleted(task); else renderFailed(task);
+        }
+      } catch (error) { $("#summary-result-hint").textContent = error.message; }
+    }, 1000);
+    pollTimer = timer;
+  } catch (error) {
+    $("#summary-result-hint").textContent = error.message;
+    $("#generate-summary").disabled = false;
+  }
+});
+document.querySelectorAll('input[name="input_source"]').forEach((input) => input.addEventListener("change", updateSourceControls));
 restoreApiHotwords();
 $("#api-hotwords-input").addEventListener("input", saveApiHotwords);
 $("#media-input").addEventListener("change", updateFileLabel);
@@ -569,7 +719,7 @@ $("#completed-back").addEventListener("click", returnFromTask);
 $("#failed-back").addEventListener("click", returnFromTask);
 document.querySelectorAll("input[data-batch-export-type]").forEach((input) => input.addEventListener("change", () => { if (currentBatch) renderBatch(currentBatch); }));
 document.querySelectorAll("input[data-task-export-type]").forEach((input) => input.addEventListener("change", updateTaskExportLink));
-document.querySelectorAll('input[name="asr_mode"]').forEach((input) => input.addEventListener("change", updateAsrControls));
+$("#asr-mode-select").addEventListener("change", updateAsrControls);
 $("#reset-button").addEventListener("click", () => { currentTaskId = null; currentBatch = null; currentBatchId = null; showPanel("empty"); $("#task-state").textContent = "等待素材"; });
 $("#delete-completed-task").addEventListener("click", async () => { if (currentTaskId) await deleteTask(currentTaskId); });
 $("#retry-failed-task").addEventListener("click", async () => { if (currentTaskId) await retryTask(currentTaskId); });
@@ -585,11 +735,45 @@ $("#copy-button").addEventListener("click", async () => {
   setTimeout(() => { $("#copy-button").textContent = "复制"; }, 1200);
 });
 $("#queue-list").addEventListener("click", async (event) => {
+  const stop = event.target.closest("button[data-stop-task-id]");
+  if (stop) {
+    stop.disabled = true;
+    try {
+      const result = await requestJson(`/api/tasks/${stop.dataset.stopTaskId}/stop`, { method: "POST" });
+      $("#batch-estimate").textContent = result.message;
+    } catch (error) { $("#form-error").textContent = error.message; }
+    return;
+  }
   const button = event.target.closest("button[data-batch-task-id]");
   if (!button || button.disabled) return;
   try { await viewTask(button.dataset.batchTaskId); } catch (error) { $("#form-error").textContent = error.message; }
 });
 $("#history-list").addEventListener("click", async (event) => {
+  const batchButton = event.target.closest("button[data-view-batch]");
+  if (batchButton) {
+    try {
+      const batch = await requestJson(`/api/batches/${batchButton.dataset.viewBatch}`);
+      clearInterval(pollTimer);
+      currentTaskId = null;
+      currentBatchId = batch.batch_id;
+      queueFilter = "all";
+      renderBatch(batch);
+      if (batch.tasks.some((task) => !terminalStatuses.has(task.status))) pollTimer = setInterval(pollBatch, 1000);
+      document.querySelector(".result-card").scrollIntoView({behavior:"smooth", block:"start"});
+    } catch (error) { $("#form-error").textContent = error.message; }
+    return;
+  }
+
+  const stop = event.target.closest("button[data-stop-task-id]");
+  if (stop) {
+    stop.disabled = true;
+    try {
+      const result = await requestJson(`/api/tasks/${stop.dataset.stopTaskId}/stop`, { method: "POST" });
+      $("#batch-estimate").textContent = result.message;
+      stop.textContent = "正在结束录制…";
+    } catch (error) { $("#form-error").textContent = error.message; stop.disabled = false; }
+    return;
+  }
   const retryButton = event.target.closest("button[data-retry-task-id]");
   if (retryButton) {
     try { await retryTask(retryButton.dataset.retryTaskId); } catch (error) { $("#form-error").textContent = error.message; }
@@ -603,7 +787,7 @@ $("#history-list").addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-task-id]");
   if (!button) return;
   try { await viewTask(button.dataset.taskId, true); } catch (error) { $("#form-error").textContent = error.message; }
-  window.scrollTo({ top: document.querySelector(".workspace").offsetTop - 20, behavior: "smooth" });
+  document.querySelector(".result-card").scrollIntoView({ behavior: "smooth", block: "start" });
 });
 
 document.addEventListener("click", (event) => {
@@ -621,11 +805,49 @@ const dropzone = $("#media-dropzone");
 dropzone.addEventListener("drop", (event) => {
   if (!event.dataTransfer.files.length) return;
   const transfer = new DataTransfer();
-  [...event.dataTransfer.files].slice(0, 30).forEach((file) => transfer.items.add(file));
+  [...event.dataTransfer.files].slice(0, 50).forEach((file) => transfer.items.add(file));
   $("#media-input").files = transfer.files;
   updateFileLabel();
 });
 
+updateSourceControls();
 loadHealth();
 loadHistory();
 loadStorage();
+
+document.querySelectorAll('input[name="douyin_action"]').forEach((input) => input.addEventListener("change", updateSourceControls));
+
+// Keep the compact settings informative without expanding the main form.
+$("#output-mode-select").addEventListener("change", () => {
+  $("#output-mode-hint").textContent = {
+    verbatim: "保留原话，字幕用于纠错。",
+    subtitle: "字幕优先，语音识别补充遗漏。",
+    clean: "对比后去填充、去重复、补标点并分段。",
+  }[$("#output-mode-select").value];
+});
+document.querySelectorAll(".main-nav a").forEach((link) => {
+  link.addEventListener("click", () => {
+    document.querySelectorAll(".main-nav a").forEach((item) => {
+      item.classList.toggle("active", item === link);
+      if (item === link) item.setAttribute("aria-current", "location");
+      else item.removeAttribute("aria-current");
+    });
+  });
+});
+
+document.querySelectorAll("[data-queue-filter]").forEach((button) => {
+  button.addEventListener("click", () => {
+    queueFilter = button.dataset.queueFilter;
+    if (currentBatch) renderBatch(currentBatch);
+  });
+});
+
+document.addEventListener("error", (event) => {
+  if (event.target.matches("img[data-thumb-key]")) {
+    if (unavailableThumbnails.size > 500) unavailableThumbnails.clear();
+    unavailableThumbnails.add(event.target.dataset.thumbKey);
+    event.target.remove();
+  }
+}, true);
+
+setInterval(() => loadHistory(), 2500);

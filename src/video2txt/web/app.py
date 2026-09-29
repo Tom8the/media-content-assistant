@@ -1,19 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
+import time
 import zipfile
 from collections.abc import Callable
-from concurrent.futures import Executor, Future, ProcessPoolExecutor
+from concurrent.futures import Executor, Future, ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime
 from multiprocessing import get_context
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock
 from typing import Annotated, Any, Literal
 from uuid import uuid4
 
@@ -26,8 +29,10 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from video2txt import __version__
 from video2txt.config import Settings, load_settings
-from video2txt.models import ASRMode, FusionMode, TaskManifest, TaskStatus
-from video2txt.pipeline import TranscriptionPipeline
+from video2txt.models import ASRMode, FusionMode, TaskManifest, TaskProgress, TaskStatus
+from video2txt.media import douyin
+from video2txt.pipeline import TranscriptionPipeline, _write_text_atomic
+from video2txt.translation.codex_cli import CodexCLIChineseTranslator
 
 MEDIA_EXTENSIONS = {
     ".aac",
@@ -48,12 +53,15 @@ DOWNLOAD_FILES = {
     "translated_subtitles_zh.srt",
     "transcript.txt",
     "translated_transcript_zh.txt",
+    "summary.md",
+    "summary.txt",
 }
 EXPORT_FILES_BY_TYPE = {
     "text": "transcript.txt",
     "subtitle": "subtitles.srt",
     "translation": "translated_subtitles_zh.srt",
     "translation_text": "translated_transcript_zh.txt",
+    "summary": "summary.md",
 }
 EXPORT_FILES_BY_KIND = {
     "all": (
@@ -65,11 +73,11 @@ EXPORT_FILES_BY_KIND = {
     "subtitle": ("subtitles.srt",),
     "text": ("transcript.txt",),
 }
-ExportType = Literal["subtitle", "text", "translation", "translation_text"]
+ExportType = Literal["subtitle", "text", "translation", "translation_text", "summary"]
 LegacyExportKind = Literal["all", "subtitle", "text"]
 MAX_UPLOAD_GB = 5
 MAX_UPLOAD_BYTES = MAX_UPLOAD_GB * 1024 * 1024 * 1024
-MAX_BATCH_FILES = 30
+MAX_BATCH_FILES = 50
 CHUNK_SIZE = 1024 * 1024
 SAFE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 TERMINAL_STATUSES = {
@@ -104,6 +112,14 @@ def _api_pipeline_available(settings: Settings) -> bool:
     )
 
 
+def _summary_available(settings: Settings) -> bool:
+    try:
+        CodexCLIChineseTranslator(settings.codex_translation, working_dir=Path(".")).ensure_available()
+        return True
+    except RuntimeError:
+        return False
+
+
 def _parse_api_hotwords(value: str) -> list[str]:
     words = list(dict.fromkeys(word.strip() for word in value.splitlines() if word.strip()))
     if len(words) > 2000:
@@ -124,16 +140,7 @@ def _batch_manifest_path(settings: Settings, batch_id: str) -> Path:
 
 
 def _write_json_atomic(path: Path, payload: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-    try:
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    _write_text_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
 
 def _write_batch_manifest(settings: Settings, payload: dict[str, Any]) -> None:
@@ -178,7 +185,14 @@ def _read_batch_manifest(settings: Settings, batch_id: str) -> dict[str, Any]:
     if not path.is_file():
         raise HTTPException(status_code=404, detail="批次不存在")
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        for attempt in range(5):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.02)
     except (OSError, ValueError) as error:
         raise HTTPException(status_code=500, detail="批次记录损坏") from error
     if payload.get("batch_id") != batch_id or not isinstance(payload.get("task_ids"), list):
@@ -193,6 +207,8 @@ def _media_stem(task: dict[str, Any]) -> str:
 
 
 def _export_filename(task: dict[str, Any], internal_name: str) -> str:
+    if internal_name in {"summary.md", "summary.txt"}:
+        return f"{_media_stem(task)}.总结报告{Path(internal_name).suffix}"
     if internal_name == "translated_subtitles_zh.srt":
         return f"{_media_stem(task)}.zh.srt"
     if internal_name == "translated_transcript_zh.txt":
@@ -266,6 +282,12 @@ def _run_pipeline_job(
     subtitle_value = job.get("subtitle_path")
     subtitle_path = Path(str(subtitle_value)) if subtitle_value else None
     try:
+        if job.get("summary_only"):
+            manifest = TaskManifest.model_validate_json(
+                (settings.paths.output_dir / str(job["task_id"]) / "task.json").read_text(encoding="utf-8")
+            )
+            TranscriptionPipeline(settings).summarize_existing(manifest)
+            return None
         TranscriptionPipeline(settings).run(
             Path(str(job["media_path"])),
             output_dir=settings.paths.output_dir / str(job["task_id"]),
@@ -278,6 +300,10 @@ def _run_pipeline_job(
             translate_to_chinese=bool(job.get("translate_to_chinese")),
             asr_mode=ASRMode(str(job.get("asr_mode") or ASRMode.LOCAL)),
             api_hotwords=[str(item) for item in (job.get("api_hotwords") or [])],
+            source_url=job.get("source_url"),
+            source_kind=job.get("source_kind"),
+            recording_minutes=job.get("recording_minutes"),
+            summarize=bool(job.get("summarize")),
         )
     except Exception as error:
         return str(error)
@@ -309,6 +335,7 @@ def _manifest_payload(manifest: TaskManifest) -> dict[str, Any]:
     if manifest.status == TaskStatus.COMPLETED:
         _backfill_translated_text(manifest)
     payload = manifest.model_dump(mode="json")
+    payload["source_media_available"] = bool(manifest.source_kind and manifest.input_path.is_file())
     if manifest.input_path.is_file():
         payload["media_size"] = manifest.input_path.stat().st_size
     payload["download_files"] = [
@@ -317,6 +344,9 @@ def _manifest_payload(manifest: TaskManifest) -> dict[str, Any]:
     transcript = manifest.output_dir / "transcript.txt"
     if transcript.is_file():
         payload["transcript_preview"] = transcript.read_text(encoding="utf-8")
+    report = manifest.output_dir / "summary.md"
+    if report.is_file():
+        payload["summary_preview"] = report.read_text(encoding="utf-8")
     for probe_path in (
         manifest.output_dir / "probe.json",
         manifest.work_dir / "probe.json",
@@ -350,11 +380,20 @@ def create_app(
         mp_context=get_context("spawn"),
     )
     settings_payload = resolved_settings.model_dump(mode="json")
+    acquisition_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="douyin")
+    live_executor = ThreadPoolExecutor(max_workers=douyin.MAX_LIVE_RECORDINGS, thread_name_prefix="douyin-live")
+    batch_update_lock = Lock()
+    shutdown_requested = Event()
+    submitted_ids: set[str] = set()
+    submission_lock = Lock()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):  # type: ignore[no-untyped-def]
         recover_pending_tasks()
         yield
+        shutdown_requested.set()
+        await asyncio.to_thread(acquisition_executor.shutdown, wait=True, cancel_futures=True)
+        await asyncio.to_thread(live_executor.shutdown, wait=True, cancel_futures=True)
         executor.shutdown(wait=False, cancel_futures=True)
 
     app = FastAPI(title="Video2Txt", version=__version__, lifespan=lifespan)
@@ -385,7 +424,16 @@ def create_app(
         ):
             manifest_path = root / safe_task_id / "task.json"
             if manifest_path.is_file():
-                return TaskManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+                for attempt in range(5):
+                    try:
+                        return TaskManifest.model_validate_json(
+                            manifest_path.read_text(encoding="utf-8")
+                        )
+                    except PermissionError:
+                        # Windows may briefly deny reads while the worker replaces this file.
+                        if attempt == 4:
+                            raise
+                        time.sleep(0.02)
         return None
 
     def task_payload(task_id: str) -> dict[str, Any]:
@@ -423,8 +471,65 @@ def create_app(
         mode: FusionMode,
     ) -> None:
         task_id = queued["task_id"]
+        with submission_lock:
+            if task_id in submitted_ids:
+                return
+            submitted_ids.add(task_id)
         registry.set(task_id, queued)
         job = persist_job(queued, media_path, subtitle_path, mode)
+
+        def prepare_live_segments() -> list[tuple[dict[str, Any], Path]]:
+            if queued.get("source_kind") != "live":
+                return []
+            manifest = load_task_manifest(task_id)
+            if manifest is None:
+                return []
+            plan_path = manifest.work_dir / "live-segments.json"
+            if plan_path.is_file():
+                plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            else:
+                parts = sorted(media_path.parent.glob(f"{media_path.stem}-segment-*.mkv"))
+                if not parts:
+                    return []
+                title = Path(job["original_filename"]).stem
+                plan = {"first_title": f"{title}_第001段.mkv", "children": []}
+                for index, part in enumerate(parts, 2):
+                    child_id = uuid4().hex
+                    child_media = media_path.parent.parent / child_id / "source.mkv"
+                    child = {**job, "task_id": child_id, "status": "queued", "progress": None,
+                             "error": None, "input_path": str(child_media), "media_path": str(child_media),
+                             "work_dir": str(resolved_settings.paths.work_dir.resolve() / child_id),
+                             "output_dir": str(resolved_settings.paths.output_dir.resolve() / child_id),
+                             "original_filename": f"{title}_第{index:03d}段.mkv"}
+                    plan["children"].append({"source": str(part), "job": child})
+                # Persist the move plan first so restart recovery never loses a segment.
+                _write_json_atomic(plan_path, plan)
+            children = []
+            for entry in plan["children"]:
+                child = entry["job"]
+                source, destination = Path(entry["source"]), Path(child["media_path"])
+                if not destination.is_file():
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    source.replace(destination)
+                existing = load_task_manifest(child["task_id"])
+                if existing is None:
+                    child_manifest = TaskManifest.model_validate(child)
+                    _write_json_atomic(child_manifest.output_dir / "task.json", child_manifest.model_dump(mode="json"))
+                if existing is None or existing.status not in TERMINAL_STATUSES:
+                    persist_job(child, destination, None, mode)
+                    children.append((child, destination))
+            with batch_update_lock:
+                batch = _read_batch_manifest(resolved_settings, job["batch_id"])
+                for entry in plan["children"]:
+                    child_id = entry["job"]["task_id"]
+                    if child_id not in batch["task_ids"]:
+                        batch["task_ids"].append(child_id)
+                _write_batch_manifest(resolved_settings, batch)
+            job["original_filename"] = plan["first_title"]
+            manifest.original_filename = plan["first_title"]
+            _write_json_atomic(manifest.output_dir / "task.json", manifest.model_dump(mode="json"))
+            _write_json_atomic(_task_job_path(resolved_settings, task_id), job)
+            return children
 
         def finalize_job(future: Future[str | None]) -> None:
             worker_crashed = False
@@ -438,11 +543,89 @@ def create_app(
                     task_id,
                     {**queued, "status": "failed", "error": error_message},
                 )
+                manifest = load_task_manifest(task_id)
+                if manifest is not None:
+                    manifest.status = TaskStatus.FAILED
+                    manifest.error = error_message
+                    manifest.updated_at = datetime.now().astimezone().isoformat(timespec="seconds")
+                    _write_json_atomic(manifest.output_dir / "task.json", manifest.model_dump(mode="json"))
             if not worker_crashed:
                 _task_job_path(resolved_settings, task_id).unlink(missing_ok=True)
+            with submission_lock:
+                submitted_ids.discard(task_id)
 
-        future = executor.submit(task_runner, settings_payload, job)
-        future.add_done_callback(finalize_job)
+        def transcribe() -> None:
+            children = [] if job.get("summary_only") else prepare_live_segments()
+            if not job.get("summary_only") and queued.get("source_kind") and queued.get("transcribe_after_download") is False:
+                now = datetime.now().astimezone().isoformat(timespec="seconds")
+                manifest = load_task_manifest(task_id) or TaskManifest.model_validate({
+                    **job, "input_path": media_path,
+                    "work_dir": resolved_settings.paths.work_dir.resolve() / task_id,
+                    "output_dir": resolved_settings.paths.output_dir.resolve() / task_id,
+                    "created_at": now, "updated_at": now,
+                })
+                manifest.status = TaskStatus.COMPLETED
+                manifest.progress = None
+                manifest.error = None
+                manifest.updated_at = now
+                for root in (manifest.work_dir, manifest.output_dir):
+                    _write_json_atomic(root / "task.json", manifest.model_dump(mode="json"))
+                _task_job_path(resolved_settings, task_id).unlink(missing_ok=True)
+                for child, destination in children:
+                    submit_task(child, destination, None, mode)
+                return
+            future = executor.submit(task_runner, settings_payload, job)
+            future.add_done_callback(finalize_job)
+            for child, destination in children:
+                submit_task(child, destination, None, mode)
+
+        if not job.get("summary_only") and queued.get("source_kind") and not media_path.is_file():
+            def acquire() -> None:
+                manifest = load_task_manifest(task_id)
+                if manifest is None:
+                    return
+                stop_file = manifest.work_dir / "stop-requested"
+
+                def progress(stage: str, current: int, total: int) -> None:
+                    manifest.status = TaskStatus(stage)
+                    manifest.progress = TaskProgress(stage=stage, current=current, total=total)
+                    manifest.updated_at = datetime.now().astimezone().isoformat(timespec="seconds")
+                    _write_json_atomic(manifest.output_dir / "task.json", manifest.model_dump(mode="json"))
+
+                def stopped() -> bool:
+                    return shutdown_requested.is_set() or stop_file.exists()
+
+                try:
+                    if stopped():
+                        raise douyin.AcquisitionError("任务已停止，尚未获取媒体")
+                    progress("downloading", 0, 0)
+                    if queued["source_kind"] == "live":
+                        title = douyin.record_live(
+                            queued["source_url"], media_path, queued["recording_minutes"],
+                            resolved_settings.ffmpeg.ffmpeg_path, progress, stopped,
+                        )
+                    else:
+                        title = douyin.download_video(queued["source_url"], media_path, progress, stopped)
+                    safe_title = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", title).strip(" .")[:100] or "抖音素材"
+                    job["original_filename"] = safe_title + media_path.suffix
+                    manifest.original_filename = job["original_filename"]
+                    manifest.status = TaskStatus.QUEUED
+                    manifest.progress = None
+                    _write_json_atomic(manifest.output_dir / "task.json", manifest.model_dump(mode="json"))
+                    _write_json_atomic(_task_job_path(resolved_settings, task_id), job)
+                    if not shutdown_requested.is_set():
+                        transcribe()
+                except Exception as error:
+                    # Do not persist raw HTTP/FFmpeg errors: they may contain signed URLs or cookies.
+                    manifest.status = TaskStatus.FAILED
+                    manifest.error = str(error) if isinstance(error, douyin.AcquisitionError) else "获取抖音素材失败，请检查网络和链接后重试"
+                    manifest.updated_at = datetime.now().astimezone().isoformat(timespec="seconds")
+                    _write_json_atomic(manifest.output_dir / "task.json", manifest.model_dump(mode="json"))
+                    _task_job_path(resolved_settings, task_id).unlink(missing_ok=True)
+
+            (live_executor if queued.get("source_kind") == "live" else acquisition_executor).submit(acquire)
+        else:
+            transcribe()
 
     def recover_pending_tasks() -> None:
         queue_dir = resolved_settings.paths.work_dir.resolve() / "queue"
@@ -457,11 +640,18 @@ def create_app(
                     job_path.unlink(missing_ok=True)
                     continue
                 media_path = Path(str(job["media_path"]))
+                if not job.get("summary_only") and job.get("source_kind") == "live" and not media_path.is_file():
+                    if manifest is not None:
+                        manifest.status = TaskStatus.FAILED
+                        manifest.error = "服务重启导致录制中断，部分文件已保留；请重新提交直播间链接"
+                        _write_json_atomic(manifest.output_dir / "task.json", manifest.model_dump(mode="json"))
+                    job_path.unlink(missing_ok=True)
+                    continue
                 subtitle_value = job.get("subtitle_path")
                 subtitle_path = Path(str(subtitle_value)) if subtitle_value else None
-                if not media_path.is_file() or (
+                if not job.get("summary_only") and ((not media_path.is_file() and not job.get("source_kind")) or (
                     subtitle_path is not None and not subtitle_path.is_file()
-                ):
+                )):
                     registry.set(
                         task_id,
                         {
@@ -488,6 +678,12 @@ def create_app(
                         "media_size",
                         "warnings",
                         "error",
+                        "source_url",
+                        "source_kind",
+                        "recording_minutes",
+                        "transcribe_after_download",
+                        "summarize",
+                        "summary_only",
                     )
                 }
                 queued["status"] = "queued"
@@ -527,6 +723,7 @@ def create_app(
         translate_to_chinese: bool = False,
         asr_mode: ASRMode = ASRMode.LOCAL,
         api_hotwords: list[str] | None = None,
+        summarize: bool = False,
     ) -> tuple[dict[str, Any], Path, Path | None]:
         media_suffix = Path(media.filename or "").suffix.lower()
         if media_suffix not in MEDIA_EXTENSIONS:
@@ -554,6 +751,7 @@ def create_app(
             "mode": mode.value,
             "hard_subtitles": hard_subtitles,
             "translate_to_chinese": translate_to_chinese,
+            "summarize": summarize,
             "asr_mode": asr_mode.value,
             "api_language": None,
             "api_hotwords": api_hotwords or [] if asr_mode == ASRMode.API else [],
@@ -580,7 +778,146 @@ def create_app(
             "translation_models_available": _translation_models_available(resolved_settings),
             "api_pipeline_available": _api_pipeline_available(resolved_settings),
             "api_key_environment": resolved_settings.qwen_asr.api_key_environment,
+            "douyin_video_available": douyin.available("video"),
+            "douyin_live_available": douyin.available("live") and bool(shutil.which(resolved_settings.ffmpeg.ffmpeg_path)),
+            "douyin_cookie_configured": bool(os.getenv("VIDEO2TXT_DOUYIN_COOKIE", "").strip()),
+            "max_live_recordings": douyin.MAX_LIVE_RECORDINGS,
+            "summary_available": _summary_available(resolved_settings),
         }
+
+    @app.post("/api/douyin", status_code=202)
+    def create_douyin_task(
+        url: Annotated[str, Form(max_length=65536)],
+        source_kind: Annotated[Literal["video", "live"], Form()] = "video",
+        transcribe_after_download: Annotated[bool, Form()] = True,
+        summarize: Annotated[bool, Form()] = False,
+        recording_minutes: Annotated[int, Form(ge=0, le=480)] = 0,
+        mode: Annotated[FusionMode, Form()] = FusionMode.VERBATIM,
+        hard_subtitles: Annotated[bool, Form()] = False,
+        translate_to_chinese: Annotated[bool, Form()] = False,
+        asr_mode: Annotated[ASRMode, Form()] = ASRMode.LOCAL,
+        api_hotwords: Annotated[str, Form()] = "",
+    ) -> dict[str, Any]:
+        if summarize:
+            transcribe_after_download = True
+            if not _summary_available(resolved_settings):
+                raise HTTPException(status_code=503, detail="智能总结不可用，请安装并登录 Codex CLI")
+        try:
+            source_urls = douyin.extract_urls(url, source_kind)
+        except (ValueError, douyin.AcquisitionError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from None
+        if not douyin.available(source_kind):
+            raise HTTPException(status_code=503, detail='抖音组件未安装，请安装项目的 douyin 依赖组')
+        if (source_kind == "live" or transcribe_after_download) and not shutil.which(resolved_settings.ffmpeg.ffmpeg_path):
+            raise HTTPException(status_code=503, detail="未找到 FFmpeg，请检查项目配置")
+        if transcribe_after_download and asr_mode == ASRMode.LOCAL and not (
+            resolved_settings.asr.model_path and resolved_settings.asr.model_path.is_dir()
+        ):
+            raise HTTPException(status_code=503, detail="本地 ASR 模型尚未配置")
+        if transcribe_after_download and asr_mode == ASRMode.LOCAL and translate_to_chinese and not _translation_models_available(resolved_settings):
+            raise HTTPException(status_code=503, detail="离线中文翻译模型尚未安装")
+        if transcribe_after_download and asr_mode == ASRMode.API and not _api_pipeline_available(resolved_settings):
+            raise HTTPException(status_code=503, detail="API 模式不可用，请检查千问配置和 Codex CLI 登录")
+        hotwords = _parse_api_hotwords(api_hotwords) if transcribe_after_download else []
+        batch_id = uuid4().hex
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        jobs = []
+        for index, source_url in enumerate(source_urls, 1):
+            task_id = uuid4().hex
+            work_dir = resolved_settings.paths.work_dir.resolve() / task_id
+            output_dir = resolved_settings.paths.output_dir.resolve() / task_id
+            media_path = resolved_settings.paths.work_dir.resolve() / "uploads" / batch_id / task_id / (
+                "source.mkv" if source_kind == "live" else "source.mp4"
+            )
+            manifest = TaskManifest(
+                task_id=task_id, batch_id=batch_id, status=TaskStatus.QUEUED,
+                input_path=media_path, original_filename=f"抖音直播 {index}" if source_kind == "live" else f"抖音视频 {index}",
+                work_dir=work_dir, output_dir=output_dir, mode=mode,
+                asr_mode=asr_mode, hard_subtitles=hard_subtitles and transcribe_after_download,
+                transcribe_after_download=transcribe_after_download,
+                summarize=summarize,
+                translate_to_chinese=transcribe_after_download and (translate_to_chinese or asr_mode == ASRMode.API),
+                api_hotwords=hotwords if asr_mode == ASRMode.API else [],
+                source_url=source_url, source_kind=source_kind,
+                recording_minutes=recording_minutes if source_kind == "live" else None,
+                created_at=now, updated_at=now,
+            )
+            work_dir.mkdir(parents=True, exist_ok=True)
+            _write_json_atomic(output_dir / "task.json", manifest.model_dump(mode="json"))
+            queued = manifest.model_dump(mode="json")
+            jobs.append((queued, media_path))
+        batch = {"batch_id": batch_id, "created_at": now, "task_ids": [job["task_id"] for job, _ in jobs], "mode": mode.value}
+        _write_batch_manifest(resolved_settings, batch)
+        for queued, media_path in jobs:
+            submit_task(queued, media_path, None, mode)
+        return {**batch, "tasks": [job for job, _ in jobs]}
+
+    @app.post("/api/tasks/{task_id}/stop", status_code=202)
+    def stop_recording(task_id: str) -> dict[str, Any]:
+        manifest = load_task_manifest(task_id)
+        if manifest is None:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        if manifest.source_kind != "live" or manifest.status not in {
+            TaskStatus.QUEUED, TaskStatus.DOWNLOADING, TaskStatus.RECORDING,
+        } or manifest.input_path.is_file():
+            raise HTTPException(status_code=409, detail="该任务当前不在录制阶段")
+        manifest.work_dir.mkdir(parents=True, exist_ok=True)
+        (manifest.work_dir / "stop-requested").touch()
+        message = "正在结束录制并保存分段视频"
+        if manifest.transcribe_after_download:
+            message += "，随后逐段转字幕"
+        return {"task_id": task_id, "message": message}
+
+    @app.get("/api/tasks/{task_id}/source")
+    def download_source(task_id: str) -> FileResponse:
+        manifest = load_task_manifest(task_id)
+        if manifest is None or not manifest.source_kind:
+            raise HTTPException(status_code=404, detail="没有下载的抖音素材")
+        media = manifest.input_path.resolve()
+        root = resolved_settings.paths.work_dir.resolve() / "uploads"
+        if root not in media.parents or not media.is_file():
+            raise HTTPException(status_code=404, detail="媒体尚未获取完成或已清理")
+        return FileResponse(
+            media, filename=_media_stem(manifest.model_dump()) + media.suffix,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/api/tasks/{task_id}/thumbnail")
+    def task_thumbnail(task_id: str) -> FileResponse:
+        manifest = load_task_manifest(task_id)
+        if manifest is None:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        cached = manifest.work_dir / "thumbnail.jpg"
+        if cached.is_file():
+            return FileResponse(cached, media_type="image/jpeg")
+        media = manifest.input_path.resolve()
+        root = resolved_settings.paths.work_dir.resolve() / "uploads"
+        if root not in media.parents:
+            raise HTTPException(status_code=404, detail="无可用缩略图")
+        if not media.is_file() and manifest.source_kind == "live":
+            parts = sorted(media.parent.glob(f"{media.stem}.part-*.mkv"))
+            if parts:
+                media = parts[0]
+        if not media.is_file() or media.stat().st_size < 1024:
+            raise HTTPException(status_code=404, detail="画面尚未就绪")
+        manifest.work_dir.mkdir(parents=True, exist_ok=True)
+        temporary = cached.with_name(f"thumbnail-{uuid4().hex}.jpg")
+        try:
+            subprocess.run([
+                resolved_settings.ffmpeg.ffmpeg_path, "-hide_banner", "-loglevel", "error",
+                "-nostdin", "-i", str(media), "-frames:v", "1", "-vf",
+                "scale=240:136:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=240:136:(ow-iw)/2:(oh-ih)/2",
+                "-q:v", "4", "-y", str(temporary),
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8, check=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if not temporary.is_file():
+                raise HTTPException(status_code=404, detail="素材没有视频画面")
+            temporary.replace(cached)
+        except (OSError, subprocess.SubprocessError):
+            raise HTTPException(status_code=404, detail="暂时无法生成缩略图") from None
+        finally:
+            temporary.unlink(missing_ok=True)
+        return FileResponse(cached, media_type="image/jpeg")
 
     @app.get("/api/storage")
     def get_storage() -> dict[str, Any]:
@@ -618,26 +955,27 @@ def create_app(
         page: Annotated[int, Query(ge=1)] = 1,
         page_size: Annotated[int, Query(ge=1, le=100)] = 12,
     ) -> dict[str, Any]:
-        tasks: list[dict[str, Any]] = []
-        output_root = resolved_settings.paths.output_dir.resolve()
-        if output_root.is_dir():
-            manifests = sorted(
-                output_root.glob("*/task.json"),
-                key=lambda path: path.stat().st_mtime,
-                reverse=True,
-            )
-            total = len(manifests)
-            start = (page - 1) * page_size
-            for manifest_path in manifests[start : start + page_size]:
+        records: dict[str, dict[str, Any]] = {}
+        # Include local work-in-progress and waiting jobs, not just exported results.
+        for root in (resolved_settings.paths.output_dir.resolve(), resolved_settings.paths.work_dir.resolve()):
+            for path in root.glob("*/task.json"):
                 try:
-                    manifest = TaskManifest.model_validate_json(
-                        manifest_path.read_text(encoding="utf-8")
-                    )
+                    manifest = TaskManifest.model_validate_json(path.read_text(encoding="utf-8"))
+                    previous = records.get(manifest.task_id)
+                    if previous is None or manifest.updated_at > previous.get("updated_at", ""):
+                        records[manifest.task_id] = _manifest_payload(manifest)
                 except (OSError, ValueError):
                     continue
-                tasks.append(_manifest_payload(manifest))
-        else:
-            total = 0
+        for path in (resolved_settings.paths.work_dir.resolve() / "queue").glob("*.json"):
+            try:
+                job = json.loads(path.read_text(encoding="utf-8"))
+                records.setdefault(job["task_id"], job)
+            except (OSError, ValueError, KeyError):
+                continue
+        ordered = sorted(records.values(), key=lambda task: task.get("created_at") or task.get("updated_at") or "", reverse=True)
+        total = len(ordered)
+        start = (page - 1) * page_size
+        tasks = ordered[start:start + page_size]
         return {
             "tasks": tasks,
             "page": page,
@@ -698,6 +1036,16 @@ def create_app(
             raise HTTPException(status_code=404, detail="任务不存在")
         if manifest.status != TaskStatus.FAILED:
             raise HTTPException(status_code=409, detail="只有失败任务可以重试")
+        if not manifest.input_path.is_file() and manifest.source_kind:
+            return create_douyin_task(
+                url=manifest.source_url, source_kind=manifest.source_kind,
+                transcribe_after_download=manifest.transcribe_after_download,
+                summarize=manifest.summarize,
+                recording_minutes=manifest.recording_minutes if manifest.recording_minutes is not None else 0, mode=manifest.mode,
+                hard_subtitles=manifest.hard_subtitles,
+                translate_to_chinese=manifest.translate_to_chinese,
+                asr_mode=manifest.asr_mode, api_hotwords="\n".join(manifest.api_hotwords),
+            )
         if not manifest.input_path.is_file():
             raise HTTPException(status_code=409, detail="原始上传文件已被清理，无法重试")
 
@@ -732,6 +1080,11 @@ def create_app(
             "api_language": manifest.api_language,
             "api_hotwords": manifest.api_hotwords,
             "original_filename": manifest.original_filename or manifest.input_path.name,
+            "source_url": manifest.source_url,
+            "source_kind": manifest.source_kind,
+            "transcribe_after_download": manifest.transcribe_after_download,
+            "summarize": manifest.summarize,
+            "recording_minutes": manifest.recording_minutes,
             "media_size": media_path.stat().st_size,
             "warnings": [],
             "error": None,
@@ -750,6 +1103,30 @@ def create_app(
         _write_batch_manifest(resolved_settings, batch)
         submit_task(queued, media_path, subtitle_path, manifest.mode)
         return {**batch, "tasks": [queued]}
+
+    @app.post("/api/tasks/{task_id}/summarize", status_code=202)
+    def summarize_task(task_id: str) -> dict[str, Any]:
+        manifest = load_task_manifest(task_id)
+        if manifest is None:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        if manifest.status != TaskStatus.COMPLETED or _task_job_path(resolved_settings, task_id).exists():
+            raise HTTPException(status_code=409, detail="请等待当前任务完成后再生成总结")
+        if not (manifest.output_dir / "fusion.json").is_file():
+            raise HTTPException(status_code=400, detail="请先完成字幕转写，再生成总结")
+        if not _summary_available(resolved_settings):
+            raise HTTPException(status_code=503, detail="智能总结不可用，请安装并登录 Codex CLI")
+        with submission_lock:
+            if task_id in submitted_ids:
+                raise HTTPException(status_code=409, detail="总结任务已在处理中")
+        manifest.summarize = True
+        manifest.summary_error = None
+        manifest.status = TaskStatus.SUMMARIZING
+        manifest.progress = TaskProgress(stage="summarizing", current=0, total=1)
+        manifest.updated_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        _write_json_atomic(manifest.output_dir / "task.json", manifest.model_dump(mode="json"))
+        queued = {**manifest.model_dump(mode="json"), "summary_only": True}
+        submit_task(queued, manifest.input_path, None, manifest.mode)
+        return task_payload(task_id)
 
     @app.delete("/api/tasks/{task_id}")
     def delete_task(task_id: str) -> dict[str, Any]:
@@ -783,15 +1160,16 @@ def create_app(
             batch_path = _batch_manifest_path(
                 resolved_settings, _validate_id(str(batch_id), "批次")
             )
-            if batch_path.is_file():
-                batch = json.loads(batch_path.read_text(encoding="utf-8"))
-                batch["task_ids"] = [
-                    item for item in batch.get("task_ids", []) if item != safe_task_id
-                ]
-                if batch["task_ids"]:
-                    _write_batch_manifest(resolved_settings, batch)
-                else:
-                    batch_path.unlink(missing_ok=True)
+            with batch_update_lock:
+                if batch_path.is_file():
+                    batch = _read_batch_manifest(resolved_settings, str(batch_id))
+                    batch["task_ids"] = [
+                        item for item in batch.get("task_ids", []) if item != safe_task_id
+                    ]
+                    if batch["task_ids"]:
+                        _write_batch_manifest(resolved_settings, batch)
+                    else:
+                        batch_path.unlink(missing_ok=True)
         return {"task_id": safe_task_id, "freed_bytes": freed_bytes, **storage_payload()}
 
     @app.get("/api/tasks/{task_id}/files/{filename}")
@@ -853,7 +1231,10 @@ def create_app(
         translate_to_chinese: Annotated[bool, Form()] = False,
         asr_mode: Annotated[ASRMode, Form()] = ASRMode.LOCAL,
         api_hotwords: Annotated[str, Form()] = "",
+        summarize: Annotated[bool, Form()] = False,
     ) -> dict[str, Any]:
+        if summarize and not _summary_available(resolved_settings):
+            raise HTTPException(status_code=503, detail="智能总结不可用，请安装并登录 Codex CLI")
         model_path = resolved_settings.asr.model_path
         if asr_mode == ASRMode.LOCAL and (model_path is None or not model_path.is_dir()):
             raise HTTPException(status_code=503, detail="本地 ASR 模型尚未配置")
@@ -883,6 +1264,7 @@ def create_app(
             translate_to_chinese=effective_translation,
             asr_mode=asr_mode,
             api_hotwords=hotwords,
+            summarize=summarize,
         )
         submit_task(queued, media_path, subtitle_path, mode)
         return queued
@@ -896,7 +1278,10 @@ def create_app(
         translate_to_chinese: Annotated[bool, Form()] = False,
         asr_mode: Annotated[ASRMode, Form()] = ASRMode.LOCAL,
         api_hotwords: Annotated[str, Form()] = "",
+        summarize: Annotated[bool, Form()] = False,
     ) -> dict[str, Any]:
+        if summarize and not _summary_available(resolved_settings):
+            raise HTTPException(status_code=503, detail="智能总结不可用，请安装并登录 Codex CLI")
         model_path = resolved_settings.asr.model_path
         if asr_mode == ASRMode.LOCAL and (model_path is None or not model_path.is_dir()):
             raise HTTPException(status_code=503, detail="本地 ASR 模型尚未配置")
@@ -965,6 +1350,7 @@ def create_app(
                         translate_to_chinese=effective_translation,
                         asr_mode=asr_mode,
                         api_hotwords=hotwords,
+                        summarize=summarize,
                     )
                 )
         except Exception:

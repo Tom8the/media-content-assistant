@@ -8,6 +8,8 @@ from pydantic import BaseModel, Field, model_validator
 
 class TaskStatus(StrEnum):
     QUEUED = "queued"
+    DOWNLOADING = "downloading"
+    RECORDING = "recording"
     PROBING = "probing"
     EXTRACTING = "extracting"
     TRANSCRIBING = "transcribing"
@@ -15,6 +17,7 @@ class TaskStatus(StrEnum):
     ALIGNING = "aligning"
     EXPORTING = "exporting"
     TRANSLATING = "translating"
+    SUMMARIZING = "summarizing"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -206,6 +209,12 @@ class TaskManifest(BaseModel):
     input_path: Path
     original_filename: str | None = None
     batch_id: str | None = None
+    source_url: str | None = None
+    source_kind: str | None = None
+    transcribe_after_download: bool = True
+    summarize: bool = False
+    summary_error: str | None = None
+    recording_minutes: int | None = None
     input_sha256: str | None = None
     work_dir: Path
     output_dir: Path

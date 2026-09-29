@@ -5,3 +5,13 @@ models/
 work/
 output/
 secrets.env
+.pytest_cache/
+.ruff_cache/
+
+# Local configuration and credentials
+config.toml
+.env
+.env.*
+!.env.example
+*.pem
+*.key
