@@ -53,6 +53,13 @@ progress_interval_frames = 5
 work_dir = "work"
 output_dir = "output"
 
+[douyin]
+# 可选：highest、original、lowest、1440p、1080p、720p、540p、480p、360p。
+# original 会尝试平台提供的上传原片地址，失败时自动降级到最高可用清晰度。
+video_quality = "highest"
+# 单个候选地址的额外重试轮数；不同地址会自动切换。
+retry_times = 3
+
 [translation]
 # NLLB INT8 直译模型目录；首次执行 video2txt install-translation-models 下载。
 model_path = "models/nllb-ct2-int8"

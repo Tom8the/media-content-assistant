@@ -13,7 +13,7 @@ import zipfile
 from collections.abc import Callable
 from concurrent.futures import Executor, Future, ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import date, datetime
 from multiprocessing import get_context
 from pathlib import Path
 from threading import Event, Lock
@@ -22,7 +22,7 @@ from uuid import uuid4
 
 import pysubs2
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -127,6 +127,16 @@ def _parse_api_hotwords(value: str) -> list[str]:
     if any(len(word) > 200 for word in words):
         raise HTTPException(status_code=400, detail="API 热词单条不能超过 200 个字符")
     return words
+
+
+def _parse_optional_date(value: str, label: str) -> date | None:
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=f"{label}请使用 YYYY-MM-DD 格式") from error
 
 
 def _validate_id(value: str, label: str) -> str:
@@ -302,6 +312,8 @@ def _run_pipeline_job(
             api_hotwords=[str(item) for item in (job.get("api_hotwords") or [])],
             source_url=job.get("source_url"),
             source_kind=job.get("source_kind"),
+            source_video_id=job.get("source_video_id"),
+            download_quality=job.get("download_quality"),
             recording_minutes=job.get("recording_minutes"),
             summarize=bool(job.get("summarize")),
         )
@@ -386,6 +398,106 @@ def create_app(
     shutdown_requested = Event()
     submitted_ids: set[str] = set()
     submission_lock = Lock()
+    history_lock = Lock()
+    history_path = resolved_settings.paths.work_dir.resolve() / "download-history.json"
+    douyin.configure_cookie_store(resolved_settings.paths.work_dir.resolve() / "douyin-cookie.json")
+    cookie_login = douyin.DouyinCookieLogin()
+
+    def read_download_history() -> dict[str, dict[str, Any]]:
+        if not history_path.is_file():
+            return {}
+        try:
+            payload = json.loads(history_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        entries = payload.get("videos") if isinstance(payload, dict) else None
+        if not isinstance(entries, dict):
+            return {}
+        return {
+            str(video_id): entry
+            for video_id, entry in entries.items()
+            if str(video_id).isdigit() and isinstance(entry, dict)
+        }
+
+    def write_download_history(entries: dict[str, dict[str, Any]]) -> None:
+        _write_json_atomic(history_path, {"version": 1, "videos": entries})
+
+    def reserve_or_skip_video(
+        source: douyin.VideoSource,
+        *,
+        task_id: str,
+        redownload_missing: bool,
+        skip_downloaded: bool,
+    ) -> str | None:
+        """Reserve a work ID so two batches cannot download it concurrently."""
+        with history_lock:
+            entries = read_download_history()
+            existing = entries.get(source.video_id)
+            if existing and skip_downloaded:
+                state = str(existing.get("state") or "completed")
+                media_value = existing.get("media_path")
+                media = Path(str(media_value)) if media_value else None
+                if state == "pending":
+                    existing_task_id = str(existing.get("task_id") or "")
+                    existing_manifest = (
+                        load_task_manifest(existing_task_id)
+                        if SAFE_ID_PATTERN.fullmatch(existing_task_id)
+                        else None
+                    )
+                    if existing_manifest is not None and existing_manifest.status not in TERMINAL_STATUSES:
+                        return "该视频已在下载队列中"
+                    # A shutdown may happen after reserving an ID but before persisting its task.
+                    entries.pop(source.video_id, None)
+                    existing = None
+                if media is not None and media.is_file() and media.stat().st_size >= 1024:
+                    return "该视频已下载，已按设置跳过"
+                if not redownload_missing:
+                    return "历史记录存在但原文件已清理，已按设置跳过"
+                entries.pop(source.video_id, None)
+            entries[source.video_id] = {
+                "state": "pending",
+                "task_id": task_id,
+                "source_url": source.url,
+                "title": source.title,
+                "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            }
+            write_download_history(entries)
+        return None
+
+    def complete_video_history(
+        video_id: str,
+        *,
+        task_id: str,
+        source_url: str,
+        media_path: Path,
+        title: str,
+        quality: str,
+    ) -> None:
+        with history_lock:
+            entries = read_download_history()
+            existing = entries.get(video_id)
+            if existing and existing.get("task_id") not in {None, task_id}:
+                return
+            entries[video_id] = {
+                "state": "completed",
+                "task_id": task_id,
+                "source_url": source_url,
+                "media_path": str(media_path.resolve()),
+                "title": title,
+                "quality": quality,
+                "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            }
+            write_download_history(entries)
+
+    def release_video_reservation(video_id: str | None, task_id: str) -> None:
+        if not video_id:
+            return
+        with history_lock:
+            entries = read_download_history()
+            entry = entries.get(video_id)
+            if entry and entry.get("state") == "pending" and entry.get("task_id") == task_id:
+                entries.pop(video_id, None)
+                write_download_history(entries)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):  # type: ignore[no-untyped-def]
@@ -401,6 +513,7 @@ def create_app(
     app.state.registry = registry
     app.state.executor = executor
     app.state.multipart_temp_dir = multipart_temp_dir
+    app.state.douyin_cookie_login = cookie_login
 
     @app.exception_handler(StarletteHTTPException)
     async def friendly_http_error(
@@ -605,7 +718,27 @@ def create_app(
                             resolved_settings.ffmpeg.ffmpeg_path, progress, stopped,
                         )
                     else:
-                        title = douyin.download_video(queued["source_url"], media_path, progress, stopped)
+                        downloaded = douyin.download_video(
+                            queued["source_url"],
+                            media_path,
+                            progress,
+                            stopped,
+                            quality=str(queued.get("download_quality") or resolved_settings.douyin.video_quality),
+                            retry_times=resolved_settings.douyin.retry_times,
+                        )
+                        title = downloaded.title
+                        queued["source_video_id"] = downloaded.video_id
+                        queued["download_quality"] = downloaded.quality
+                        manifest.source_video_id = downloaded.video_id
+                        manifest.download_quality = downloaded.quality
+                        complete_video_history(
+                            downloaded.video_id,
+                            task_id=task_id,
+                            source_url=str(queued["source_url"]),
+                            media_path=media_path,
+                            title=downloaded.title,
+                            quality=downloaded.quality,
+                        )
                     safe_title = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", title).strip(" .")[:100] or "抖音素材"
                     job["original_filename"] = safe_title + media_path.suffix
                     manifest.original_filename = job["original_filename"]
@@ -618,10 +751,18 @@ def create_app(
                 except Exception as error:
                     # Do not persist raw HTTP/FFmpeg errors: they may contain signed URLs or cookies.
                     manifest.status = TaskStatus.FAILED
-                    manifest.error = str(error) if isinstance(error, douyin.AcquisitionError) else "获取抖音素材失败，请检查网络和链接后重试"
+                    manifest.cookie_login_required = douyin.requires_cookie_login(error)
+                    manifest.error = (
+                        "抖音需要登录验证，请扫码登录后重试"
+                        if manifest.cookie_login_required
+                        else str(error) if isinstance(error, douyin.AcquisitionError)
+                        else "获取抖音素材失败，请检查网络和链接后重试"
+                    )
                     manifest.updated_at = datetime.now().astimezone().isoformat(timespec="seconds")
                     _write_json_atomic(manifest.output_dir / "task.json", manifest.model_dump(mode="json"))
                     _task_job_path(resolved_settings, task_id).unlink(missing_ok=True)
+                    if queued.get("source_kind") == "video":
+                        release_video_reservation(queued.get("source_video_id"), task_id)
 
             (live_executor if queued.get("source_kind") == "live" else acquisition_executor).submit(acquire)
         else:
@@ -680,6 +821,8 @@ def create_app(
                         "error",
                         "source_url",
                         "source_kind",
+                        "source_video_id",
+                        "download_quality",
                         "recording_minutes",
                         "transcribe_after_download",
                         "summarize",
@@ -780,10 +923,34 @@ def create_app(
             "api_key_environment": resolved_settings.qwen_asr.api_key_environment,
             "douyin_video_available": douyin.available("video"),
             "douyin_live_available": douyin.available("live") and bool(shutil.which(resolved_settings.ffmpeg.ffmpeg_path)),
-            "douyin_cookie_configured": bool(os.getenv("VIDEO2TXT_DOUYIN_COOKIE", "").strip()),
+            "douyin_cookie_configured": douyin.cookie_configured(),
+            "douyin_cookie_login_available": importlib.util.find_spec("playwright") is not None,
             "max_live_recordings": douyin.MAX_LIVE_RECORDINGS,
             "summary_available": _summary_available(resolved_settings),
         }
+
+    @app.get("/api/douyin/cookie-login")
+    def get_douyin_cookie_login() -> dict[str, object]:
+        """Return scan state only; the Cookie itself never leaves this machine."""
+        return cookie_login.status()
+
+    @app.get("/api/douyin/cookie-login/preview")
+    def get_douyin_cookie_login_preview() -> Response:
+        preview = cookie_login.preview()
+        if preview is None:
+            raise HTTPException(status_code=404, detail="扫码二维码暂不可用")
+        return Response(content=preview, media_type="image/png", headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/douyin/cookie-login/start", status_code=202)
+    def start_douyin_cookie_login() -> dict[str, object]:
+        status = cookie_login.start()
+        if status.get("state") == "unavailable":
+            raise HTTPException(status_code=503, detail=str(status.get("message")))
+        return status
+
+    @app.post("/api/douyin/cookie-login/cancel")
+    def cancel_douyin_cookie_login() -> dict[str, object]:
+        return cookie_login.cancel()
 
     @app.post("/api/douyin", status_code=202)
     def create_douyin_task(
@@ -792,6 +959,15 @@ def create_app(
         transcribe_after_download: Annotated[bool, Form()] = True,
         summarize: Annotated[bool, Form()] = False,
         recording_minutes: Annotated[int, Form(ge=0, le=480)] = 0,
+        download_quality: Annotated[
+            Literal["highest", "original", "lowest", "1440p", "1080p", "720p", "540p", "480p", "360p"],
+            Form(),
+        ] = "highest",
+        skip_downloaded: Annotated[bool, Form()] = True,
+        redownload_missing: Annotated[bool, Form()] = True,
+        profile_limit: Annotated[int, Form(ge=1, le=50)] = 50,
+        start_date: Annotated[str, Form()] = "",
+        end_date: Annotated[str, Form()] = "",
         mode: Annotated[FusionMode, Form()] = FusionMode.VERBATIM,
         hard_subtitles: Annotated[bool, Form()] = False,
         translate_to_chinese: Annotated[bool, Form()] = False,
@@ -803,8 +979,23 @@ def create_app(
             if not _summary_available(resolved_settings):
                 raise HTTPException(status_code=503, detail="智能总结不可用，请安装并登录 Codex CLI")
         try:
-            source_urls = douyin.extract_urls(url, source_kind)
+            parsed_start_date = _parse_optional_date(start_date, "开始日期")
+            parsed_end_date = _parse_optional_date(end_date, "结束日期")
+            if source_kind == "video":
+                sources = douyin.expand_video_sources(
+                    url,
+                    start_date=parsed_start_date,
+                    end_date=parsed_end_date,
+                    limit=profile_limit,
+                )
+            else:
+                sources = [
+                    douyin.VideoSource(source_url, "")
+                    for source_url in douyin.extract_urls(url, source_kind)
+                ]
         except (ValueError, douyin.AcquisitionError) as error:
+            if douyin.requires_cookie_login(error):
+                raise HTTPException(status_code=401, detail="抖音需要登录验证，请扫码登录后重试") from None
             raise HTTPException(status_code=400, detail=str(error)) from None
         if not douyin.available(source_kind):
             raise HTTPException(status_code=503, detail='抖音组件未安装，请安装项目的 douyin 依赖组')
@@ -822,8 +1013,23 @@ def create_app(
         batch_id = uuid4().hex
         now = datetime.now().astimezone().isoformat(timespec="seconds")
         jobs = []
-        for index, source_url in enumerate(source_urls, 1):
+        skipped: list[dict[str, str]] = []
+        for index, source in enumerate(sources, 1):
             task_id = uuid4().hex
+            if source_kind == "video":
+                reason = reserve_or_skip_video(
+                    source,
+                    task_id=task_id,
+                    redownload_missing=redownload_missing,
+                    skip_downloaded=skip_downloaded,
+                )
+                if reason:
+                    skipped.append({
+                        "video_id": source.video_id,
+                        "title": source.title or f"抖音视频 {index}",
+                        "reason": reason,
+                    })
+                    continue
             work_dir = resolved_settings.paths.work_dir.resolve() / task_id
             output_dir = resolved_settings.paths.output_dir.resolve() / task_id
             media_path = resolved_settings.paths.work_dir.resolve() / "uploads" / batch_id / task_id / (
@@ -831,14 +1037,22 @@ def create_app(
             )
             manifest = TaskManifest(
                 task_id=task_id, batch_id=batch_id, status=TaskStatus.QUEUED,
-                input_path=media_path, original_filename=f"抖音直播 {index}" if source_kind == "live" else f"抖音视频 {index}",
+                input_path=media_path,
+                original_filename=(
+                    f"抖音直播 {index}"
+                    if source_kind == "live"
+                    else (source.title or f"抖音视频 {index}")
+                ),
                 work_dir=work_dir, output_dir=output_dir, mode=mode,
                 asr_mode=asr_mode, hard_subtitles=hard_subtitles and transcribe_after_download,
                 transcribe_after_download=transcribe_after_download,
                 summarize=summarize,
                 translate_to_chinese=transcribe_after_download and (translate_to_chinese or asr_mode == ASRMode.API),
                 api_hotwords=hotwords if asr_mode == ASRMode.API else [],
-                source_url=source_url, source_kind=source_kind,
+                source_url=source.url,
+                source_kind=source_kind,
+                source_video_id=source.video_id or None,
+                download_quality=download_quality if source_kind == "video" else None,
                 recording_minutes=recording_minutes if source_kind == "live" else None,
                 created_at=now, updated_at=now,
             )
@@ -846,11 +1060,20 @@ def create_app(
             _write_json_atomic(output_dir / "task.json", manifest.model_dump(mode="json"))
             queued = manifest.model_dump(mode="json")
             jobs.append((queued, media_path))
+        if not jobs:
+            return {
+                "batch_id": batch_id,
+                "created_at": now,
+                "task_ids": [],
+                "tasks": [],
+                "mode": mode.value,
+                "skipped": skipped,
+            }
         batch = {"batch_id": batch_id, "created_at": now, "task_ids": [job["task_id"] for job, _ in jobs], "mode": mode.value}
         _write_batch_manifest(resolved_settings, batch)
         for queued, media_path in jobs:
             submit_task(queued, media_path, None, mode)
-        return {**batch, "tasks": [job for job, _ in jobs]}
+        return {**batch, "tasks": [job for job, _ in jobs], "skipped": skipped}
 
     @app.post("/api/tasks/{task_id}/stop", status_code=202)
     def stop_recording(task_id: str) -> dict[str, Any]:
@@ -1042,6 +1265,8 @@ def create_app(
                 transcribe_after_download=manifest.transcribe_after_download,
                 summarize=manifest.summarize,
                 recording_minutes=manifest.recording_minutes if manifest.recording_minutes is not None else 0, mode=manifest.mode,
+                download_quality=manifest.download_quality or resolved_settings.douyin.video_quality,
+                skip_downloaded=False,
                 hard_subtitles=manifest.hard_subtitles,
                 translate_to_chinese=manifest.translate_to_chinese,
                 asr_mode=manifest.asr_mode, api_hotwords="\n".join(manifest.api_hotwords),
@@ -1082,6 +1307,8 @@ def create_app(
             "original_filename": manifest.original_filename or manifest.input_path.name,
             "source_url": manifest.source_url,
             "source_kind": manifest.source_kind,
+            "source_video_id": manifest.source_video_id,
+            "download_quality": manifest.download_quality,
             "transcribe_after_download": manifest.transcribe_after_download,
             "summarize": manifest.summarize,
             "recording_minutes": manifest.recording_minutes,

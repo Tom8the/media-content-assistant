@@ -31,6 +31,77 @@ let pollTimer = null;
 let historyPage = 1;
 const historyPageSize = 12;
 let healthState = null;
+let douyinLoginTimer = null;
+const cookieLoginPromptedTasks = new Set();
+
+function closeDouyinLoginModal() {
+  clearInterval(douyinLoginTimer);
+  douyinLoginTimer = null;
+  $("#douyin-login-modal").hidden = true;
+}
+
+function showDouyinLoginStatus(status) {
+  $("#douyin-login-status").textContent = status.message || "正在获取抖音登录二维码…";
+  const preview = $("#douyin-login-preview");
+  if (status.preview_available) {
+    preview.hidden = false;
+    preview.src = `/api/douyin/cookie-login/preview?t=${Date.now()}`;
+  } else {
+    preview.hidden = true;
+    preview.removeAttribute("src");
+  }
+  if (status.state === "success") {
+    healthState = { ...healthState, douyin_cookie_configured: true };
+    updateDouyinAvailability();
+    clearInterval(douyinLoginTimer);
+    douyinLoginTimer = null;
+    window.setTimeout(() => {
+      closeDouyinLoginModal();
+      loadHealth();
+    }, 900);
+  }
+}
+
+async function refreshDouyinLoginStatus() {
+  try {
+    const status = await requestJson("/api/douyin/cookie-login", { cache: "no-store" });
+    showDouyinLoginStatus(status);
+    if (!["opening", "waiting"].includes(status.state)) {
+      clearInterval(douyinLoginTimer);
+      douyinLoginTimer = null;
+    }
+  } catch (error) {
+    $("#douyin-login-status").textContent = error.message;
+  }
+}
+
+async function openDouyinLoginModal() {
+  $("#douyin-login-modal").hidden = false;
+  $("#douyin-login-status").textContent = "正在打开抖音登录窗口…";
+  try {
+    const status = await requestJson("/api/douyin/cookie-login/start", { method: "POST" });
+    showDouyinLoginStatus(status);
+    clearInterval(douyinLoginTimer);
+    if (["opening", "waiting"].includes(status.state)) {
+      douyinLoginTimer = setInterval(refreshDouyinLoginStatus, 1500);
+      window.setTimeout(refreshDouyinLoginStatus, 500);
+    }
+  } catch (error) {
+    $("#douyin-login-status").textContent = error.message;
+  }
+}
+
+async function cancelDouyinLogin() {
+  try { await requestJson("/api/douyin/cookie-login/cancel", { method: "POST" }); } catch { /* Closing the local dialog must still work. */ }
+  closeDouyinLoginModal();
+}
+
+function promptForCookieLogin(tasks) {
+  const blocked = tasks.find((task) => task.cookie_login_required && !cookieLoginPromptedTasks.has(task.task_id));
+  if (!blocked) return;
+  cookieLoginPromptedTasks.add(blocked.task_id);
+  openDouyinLoginModal();
+}
 
 function selectedSource() {
   return document.querySelector('input[name="input_source"]:checked')?.value || "file";
@@ -55,17 +126,24 @@ function updateSourceControls() {
   $("#local-inputs").hidden = source !== "file";
   $("#douyin-inputs").hidden = source === "file";
   $("#recording-options").hidden = source !== "live";
+  $("#video-download-options").hidden = source !== "video";
   $("#media-input").required = source === "file";
   $("#douyin-url").required = source !== "file";
   $("#douyin-url").disabled = source === "file";
   $("#recording-minutes").disabled = source !== "live";
   $("#douyin-url").rows = 3;
   const liveLimit = healthState?.max_live_recordings || 10;
-  $("#douyin-url").placeholder = source === "video" ? "直接粘贴抖音分享文案或链接，支持多条、多行混合粘贴。自动提取并去重，最多 50 个视频链接。" : `粘贴多个直播间链接或分享文案，可用回车分隔。自动提取并去重，最多 ${liveLimit} 个直播间同时录制。`;
+  $("#download-quality-select").disabled = source !== "video";
+  $("#profile-limit-input").disabled = source !== "video";
+  $("#profile-start-date").disabled = source !== "video";
+  $("#profile-end-date").disabled = source !== "video";
+  $("#skip-downloaded-input").disabled = source !== "video";
+  $("#redownload-missing-input").disabled = source !== "video";
+  $("#douyin-url").placeholder = source === "video" ? "粘贴抖音视频、分享文案或账号主页链接。主页可按日期批量获取，自动按作品去重，最多 50 个视频。" : `粘贴多个直播间链接或分享文案，可用回车分隔。自动提取并去重，最多 ${liveLimit} 个直播间同时录制。`;
   document.querySelector(".file-limit").textContent = source === "live" ? `最多同时 ${liveLimit} 个直播间 · 每小时分段` : "最多 50 个 · 单个 5 GB";
   $("#douyin-hint").textContent = source === "live"
     ? "0 表示不限时，录到下播；也可随时结束录制。约每小时保存一段，结束后逐段转字幕。请保持服务运行。"
-    : "视频下载完成后自动转写，并保留原视频供下载。";
+    : "支持单视频和账号主页批量下载；下载完成后自动转写，并保留原视频供下载。";
   $("#submit-button span").textContent = source === "live" ? "批量录制并转字幕" : source === "video" ? "批量下载并转字幕" : "开始批量提取与转写";
   $("#transcription-options").hidden = downloadOnly();
   if (downloadOnly()) {
@@ -87,7 +165,9 @@ function updateDouyinAvailability() {
   if (source === "file") return;
   const available = healthState?.[source === "live" ? "douyin_live_available" : "douyin_video_available"];
   $("#douyin-health").textContent = !available ? "抖音下载组件尚未就绪，请安装后重启服务。"
-    : healthState?.douyin_cookie_configured ? "已配置抖音访问凭据。" : "可先直接尝试；遇到平台验证时需配置抖音 Cookie。";
+    : healthState?.douyin_cookie_configured ? "已配置抖音访问凭据。" : "尚未登录抖音，开始下载或录制前请扫码登录。";
+  $("#douyin-login-button").disabled = !healthState?.douyin_cookie_login_available;
+  $("#douyin-login-button").textContent = healthState?.douyin_cookie_configured ? "更新抖音登录" : "扫码登录抖音";
   if (!available) $("#submit-button").disabled = true;
 }
 
@@ -269,7 +349,7 @@ function renderTaskRow(task, index, library = false) {
     const canView = terminalStatuses.has(task.status);
     const source = task.source_kind === "live" ? "抖音直播" : task.source_kind === "video" ? "抖音视频" : "本地文件";
     const treatment = task.transcribe_after_download === false ? "仅下载视频" : task.summarize ? "转字幕并智能总结" : task.source_kind ? "下载后转字幕" : "转字幕";
-    const details = task.transcribe_after_download === false ? "保留原视频" : [modeLabels[task.mode], task.asr_mode === "api" ? "千问 API" : "本地模型", task.hard_subtitles ? "硬字幕识别" : "", task.translate_to_chinese ? "中文字幕" : ""].filter(Boolean).join(" · ");
+    const details = task.transcribe_after_download === false ? ["保留原视频", task.download_quality ? `清晰度：${task.download_quality}` : ""].filter(Boolean).join(" · ") : [modeLabels[task.mode], task.asr_mode === "api" ? "千问 API" : "本地模型", task.download_quality ? `清晰度：${task.download_quality}` : "", task.hard_subtitles ? "硬字幕识别" : "", task.translate_to_chinese ? "中文字幕" : ""].filter(Boolean).join(" · ");
     const progress = task.progress;
     const measurable = progress?.total > 0;
     const percent = task.status === "completed" ? 100 : measurable ? Math.max(0, Math.min(100, Math.round(progress.current / progress.total * 100))) : null;
@@ -453,6 +533,11 @@ async function submitForm(event) {
   if (selectedSource() !== "file") {
     $("#submit-button").disabled = true;
     try {
+      if (!healthState?.douyin_cookie_configured) {
+        $("#form-error").textContent = "需要先完成抖音扫码登录，登录成功后再提交任务。";
+        await openDouyinLoginModal();
+        return;
+      }
       // Do not upload local files from the hidden input when submitting a link.
       const source = selectedSource();
       const data = new FormData();
@@ -461,6 +546,12 @@ async function submitForm(event) {
       data.set("transcribe_after_download", String(!downloadOnly()));
       data.set("summarize", String(wantsSummary()));
       data.set("recording_minutes", source === "live" ? $("#recording-minutes").value : "30");
+      data.set("download_quality", $("#download-quality-select").value);
+      data.set("profile_limit", $("#profile-limit-input").value);
+      data.set("start_date", $("#profile-start-date").value);
+      data.set("end_date", $("#profile-end-date").value);
+      data.set("skip_downloaded", String($("#skip-downloaded-input").checked));
+      data.set("redownload_missing", String($("#redownload-missing-input").checked));
       data.set("mode", $("#output-mode-select").value);
       data.set("asr_mode", selectedAsrMode());
       data.set("hard_subtitles", String($("#hard-subtitles-input").checked));
@@ -473,8 +564,14 @@ async function submitForm(event) {
       renderBatch(batch);
       pollTimer = setInterval(pollBatch, 1000);
       await loadHistory();
+      if (batch.skipped?.length) {
+        const examples = batch.skipped.slice(0, 3).map((item) => item.title || item.video_id).join("、");
+        $("#form-error").textContent = `已跳过 ${batch.skipped.length} 个历史视频${examples ? `：${examples}` : ""}`;
+      }
+      if (!batch.tasks?.length) $("#task-state").textContent = "没有需要下载的新视频";
     } catch (error) {
       $("#form-error").textContent = error.message;
+      if (/登录验证|扫码登录/.test(error.message || "")) openDouyinLoginModal();
     } finally {
       updateAsrControls();
     }
@@ -554,6 +651,7 @@ async function loadHistory(page = historyPage) {
     const unique = [...new Map(tasks.map(task => [task.task_id, task])).values()];
     const active = unique.filter(task => !terminalStatuses.has(task.status));
     const finished = unique.filter(task => terminalStatuses.has(task.status));
+    promptForCookieLogin(unique);
     $("#batch-result").hidden = false;
     $("#empty-result").hidden = true;
     updateTable("#queue-list", active.length ? active.map((task, index) => renderTaskRow(task, index)).join("") : '<p class="history-empty">暂无执行中的任务，已结束的任务请在内容库查看。</p>');
@@ -816,6 +914,10 @@ loadHistory();
 loadStorage();
 
 document.querySelectorAll('input[name="douyin_action"]').forEach((input) => input.addEventListener("change", updateSourceControls));
+$("#douyin-login-button").addEventListener("click", openDouyinLoginModal);
+$("#douyin-login-retry").addEventListener("click", openDouyinLoginModal);
+$("#douyin-login-close").addEventListener("click", cancelDouyinLogin);
+$("#douyin-login-cancel").addEventListener("click", cancelDouyinLogin);
 
 // Keep the compact settings informative without expanding the main form.
 $("#output-mode-select").addEventListener("change", () => {

@@ -94,6 +94,15 @@ class PathSettings(BaseModel):
     output_dir: Path = Path("output")
 
 
+class DouyinSettings(BaseModel):
+    """Download defaults. Per-task selections from the web page take precedence."""
+
+    video_quality: Literal[
+        "highest", "original", "lowest", "1440p", "1080p", "720p", "540p", "480p", "360p"
+    ] = "highest"
+    retry_times: int = Field(default=3, ge=0, le=10)
+
+
 class TranslationSettings(BaseModel):
     model_path: Path = Path("models/nllb-ct2-int8")
     device: Literal["cpu", "cuda"] = "cpu"
@@ -129,6 +138,7 @@ class Settings(BaseModel):
     ocr: OCRSettings = Field(default_factory=OCRSettings)
     alignment: AlignmentSettings = Field(default_factory=AlignmentSettings)
     paths: PathSettings = Field(default_factory=PathSettings)
+    douyin: DouyinSettings = Field(default_factory=DouyinSettings)
     translation: TranslationSettings = Field(default_factory=TranslationSettings)
     qwen_asr: QwenASRSettings = Field(default_factory=QwenASRSettings)
     codex_translation: CodexTranslationSettings = Field(default_factory=CodexTranslationSettings)

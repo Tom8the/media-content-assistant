@@ -211,6 +211,8 @@ class TaskManifest(BaseModel):
     batch_id: str | None = None
     source_url: str | None = None
     source_kind: str | None = None
+    source_video_id: str | None = None
+    download_quality: str | None = None
     transcribe_after_download: bool = True
     summarize: bool = False
     summary_error: str | None = None
@@ -230,6 +232,7 @@ class TaskManifest(BaseModel):
     artifacts: dict[str, str] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
     progress: TaskProgress | None = None
+    cookie_login_required: bool = False
     error: str | None = None
     created_at: str
     updated_at: str

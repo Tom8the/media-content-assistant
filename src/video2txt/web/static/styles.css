@@ -25,6 +25,17 @@
 #douyin-inputs { margin-bottom: 20px; }
 #recording-options { margin-top: 14px; }
 #recording-minutes { width: 120px; padding: 9px; background: var(--surface-2); color: var(--text); border: 1px solid var(--line); border-radius: 8px; }
+.douyin-login-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.douyin-login-row .field-hint { margin: 0; }
+.douyin-login-row .small-button { flex: 0 0 auto; }
+.login-modal { position: fixed; z-index: 30; inset: 0; display: grid; place-items: center; padding: 20px; background: rgba(2, 10, 8, .78); backdrop-filter: blur(7px); }
+.login-modal-card { position: relative; width: min(460px, 100%); max-height: min(820px, calc(100vh - 40px)); overflow: auto; padding: 28px; border: 1px solid var(--line-strong); border-radius: 20px; background: linear-gradient(150deg, #172824, #0b1714); box-shadow: 0 24px 70px rgba(0, 0, 0, .45); }
+.login-modal-card h2 { margin: 8px 0 10px; }
+.login-modal-card > p:not(.field-hint) { color: var(--text); line-height: 1.55; }
+.login-modal-card .field-hint { margin: 14px 0 0; line-height: 1.65; }
+.login-modal-close { position: absolute; top: 13px; right: 14px; width: 32px; height: 32px; border: 1px solid var(--line); border-radius: 50%; background: transparent; color: var(--muted); font-size: 22px; line-height: 1; cursor: pointer; }
+#douyin-login-preview { display: block; width: 100%; min-height: 180px; margin: 16px 0 0; object-fit: contain; border: 1px solid var(--line); border-radius: 12px; background: #fff; }
+.login-modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
 html, body { overflow-x: hidden; }
 [hidden] { display: none !important; }
 
@@ -283,6 +294,14 @@ legend { color: #dce6ed; font-size: 13px; font-weight: 650; margin-bottom: 10px;
 #summary-hint { margin-top: 10px; }
 #recording-options { display: grid; grid-template-columns: auto 120px; justify-content: start; align-items: center; gap: 8px 16px; }
 #recording-options small { grid-column: 1 / -1; }
+#video-download-options { margin-top: 12px; padding: 12px 0 0; border-top: 1px solid var(--line); }
+.download-settings-row { gap: 12px 18px; }
+.download-settings-row .select-field input, .date-field input { width: 130px; padding: 9px 10px; border: 1px solid var(--line-strong); border-radius: 7px; background: #19262e; color: var(--text); font-size: 13px; }
+.date-field { display: flex; align-items: center; gap: 10px; color: #dce6ed; font-size: 13px; white-space: nowrap; }
+.download-preferences { display: flex; flex-wrap: wrap; gap: 12px 28px; margin-top: 12px; }
+.compact-toggle { padding: 0; flex: 0 1 auto; }
+.compact-toggle .toggle-copy { display: flex; align-items: baseline; gap: 8px; }
+.compact-toggle .toggle-copy small { max-width: none; }
 #local-inputs { margin-bottom: 20px; }
 .dropzone { min-height: 125px; padding: 16px; border-radius: 8px; background: #192a32; }
 .upload-glyph { display: none; }
@@ -366,6 +385,10 @@ footer { width: min(1300px, calc(100% - 48px)); padding: 0 0 24px; display: flex
   .processing-picker .mode-option span { min-height: 60px; }
   .settings-row { flex-direction: column; align-items: stretch; }
   #recording-options { grid-template-columns: 1fr; }
+  .download-settings-row { align-items: stretch; }
+  .date-field { justify-content: space-between; }
+  .download-settings-row .select-field input, .date-field input { width: auto; flex: 1; }
+  .compact-toggle .toggle-copy { display: block; }
   .queue-status { white-space: normal; }
 }
 @media(prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } *, *::before, *::after { animation: none !important; transition: none !important; } }

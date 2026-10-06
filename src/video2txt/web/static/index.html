@@ -9,7 +9,7 @@
       name="description"
       content="视频下载、直播录制、字幕转写与智能总结"
     />
-    <link rel="stylesheet" href="/styles.css?v=20260929-library-columns" />
+    <link rel="stylesheet" href="/styles.css?v=20261006-douyin-login" />
   </head>
   <body>
     <header class="app-header" id="workbench">
@@ -48,8 +48,49 @@
               <input id="recording-minutes" type="number" min="0" max="480" value="0" />
               <small>本批直播间使用相同时长，每个直播间可单独结束。</small>
             </label>
+            <div id="video-download-options" hidden>
+              <div class="settings-row download-settings-row">
+                <label class="select-field" for="download-quality-select">下载清晰度
+                  <select id="download-quality-select" name="download_quality">
+                    <option value="highest">最高可用</option>
+                    <option value="original">尝试上传原片</option>
+                    <option value="1080p">1080p</option>
+                    <option value="720p">720p</option>
+                    <option value="540p">540p</option>
+                    <option value="480p">480p</option>
+                    <option value="360p">360p</option>
+                    <option value="lowest">最低可用</option>
+                  </select>
+                </label>
+                <label class="select-field" for="profile-limit-input">主页下载数量
+                  <input id="profile-limit-input" name="profile_limit" type="number" min="1" max="50" value="50" />
+                </label>
+                <label class="date-field" for="profile-start-date">开始日期
+                  <input id="profile-start-date" name="start_date" type="date" />
+                </label>
+                <label class="date-field" for="profile-end-date">结束日期
+                  <input id="profile-end-date" name="end_date" type="date" />
+                </label>
+              </div>
+              <div class="download-preferences">
+                <label class="feature-toggle compact-toggle">
+                  <input id="skip-downloaded-input" name="skip_downloaded" type="checkbox" checked />
+                  <span class="toggle-track" aria-hidden="true"><i></i></span>
+                  <span class="toggle-copy"><b>跳过已下载视频</b><small>按作品 ID 跨批次去重</small></span>
+                </label>
+                <label class="feature-toggle compact-toggle">
+                  <input id="redownload-missing-input" name="redownload_missing" type="checkbox" checked />
+                  <span class="toggle-track" aria-hidden="true"><i></i></span>
+                  <span class="toggle-copy"><b>原文件缺失时重新下载</b><small>关闭后仅保留历史记录</small></span>
+                </label>
+              </div>
+              <p class="field-hint">可直接粘贴账号主页链接。页面会先获取作品，再按日期、数量和下载历史筛选；单次最多 50 个视频。</p>
+            </div>
             <p class="field-hint" id="douyin-hint">视频下载完成后自动转写，并保留原视频供下载。</p>
-            <p class="field-hint" id="douyin-health"></p>
+            <div class="douyin-login-row">
+              <p class="field-hint" id="douyin-health"></p>
+              <button class="small-button" id="douyin-login-button" type="button">扫码登录抖音</button>
+            </div>
           </div>
           <div id="local-inputs">
           <p class="input-step">2. 添加视频、音频或外挂字幕</p>
@@ -146,6 +187,21 @@ Apply Now</textarea>
           </div>
           <p class="form-error" id="form-error" role="alert"></p>
         </form>
+
+        <section class="login-modal" id="douyin-login-modal" role="dialog" aria-modal="true" aria-labelledby="douyin-login-title" hidden>
+          <div class="login-modal-card">
+            <button class="login-modal-close" id="douyin-login-close" type="button" aria-label="关闭">×</button>
+            <span class="step-number">抖音账号</span>
+            <h2 id="douyin-login-title">扫码登录抖音</h2>
+            <p id="douyin-login-status">正在准备二维码…</p>
+            <img id="douyin-login-preview" alt="抖音登录二维码预览" hidden />
+            <p class="field-hint">抖音登录窗口会同时打开。用手机抖音扫码并确认登录，成功后会自动保存到本项目，仅用于本机的下载与直播录制。</p>
+            <div class="login-modal-actions">
+              <button class="small-button" id="douyin-login-retry" type="button">重新获取二维码</button>
+              <button class="danger-button" id="douyin-login-cancel" type="button">取消</button>
+            </div>
+          </div>
+        </section>
 
         <section class="result-card" aria-live="polite">
           <div class="card-heading">
@@ -279,8 +335,8 @@ Apply Now</textarea>
 
     <footer>
       <div class="engine-pill" id="engine-pill" hidden><span class="status-dot"></span><span id="engine-label">正在检查本地引擎</span></div>
-      <span class="version">v<span id="app-version">3.0.0</span></span>
+      <span class="version">v<span id="app-version">3.1.0</span></span>
     </footer>
-    <script src="/app.js?v=20260929-library-columns" defer></script>
+    <script src="/app.js?v=20261006-douyin-login" defer></script>
   </body>
 </html>

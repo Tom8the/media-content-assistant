@@ -176,6 +176,8 @@ class TranscriptionPipeline:
         api_hotwords: list[str] | None = None,
         source_url: str | None = None,
         source_kind: str | None = None,
+        source_video_id: str | None = None,
+        download_quality: str | None = None,
         recording_minutes: int | None = None,
         summarize: bool = False,
     ) -> TaskManifest:
@@ -199,6 +201,8 @@ class TranscriptionPipeline:
             batch_id=batch_id,
             source_url=source_url,
             source_kind=source_kind,
+            source_video_id=source_video_id,
+            download_quality=download_quality,
             recording_minutes=recording_minutes,
             summarize=summarize,
             work_dir=work_dir,
